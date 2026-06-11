@@ -1,23 +1,36 @@
 capital: 100000
-mode: paper            # paper | live  (live also requires AUTOBOT_CONFIRM_LIVE env var)
-confidence_threshold: 0.70
-risk:
-  # Percent-of-capital units (consistent with NIFTY lot size of 75: 1 point = 75 rupees,
-  # so tiny fixed-rupee daily caps are not physically achievable with even one lot).
-  risk_per_trade_pct: 1.0        # max loss per trade as % of capital
-  daily_max_loss_pct: 1.0        # kill switch: halt for the day
-  daily_profit_target_pct: 2.5   # lock in the day (asymmetric rule, ~2.5:1)
-  reward_risk_min: 2.5
-  max_open_positions: 1
-  squareoff_time: "15:15"        # IST hard exit
-  theta_timeout_minutes: 45      # exit if sideways (theta bleed)
-option:
-  min_delta: 0.45                # ATM/slightly ITM only
-  risk_free_rate: 0.068
+confidence_threshold: 0.7
+mode: paper
 nature:
-  pheromone_evaporation: 0.9
   immune_z_threshold: 4.0
+  pheromone_evaporation: 0.9
 news_feeds:
-  - https://feeds.reuters.com/reuters/businessNews
-  - https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms
-  - https://www.moneycontrol.com/rss/marketreports.xml
+- https://feeds.reuters.com/reuters/businessNews
+- https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms
+- https://www.moneycontrol.com/rss/marketreports.xml
+option:
+  min_delta: 0.45
+  risk_free_rate: 0.068
+regimes:
+  choppy:
+    confidence_threshold: 0.55
+    daily_max_loss_pct: 2.0
+    min_delta: 0.45
+    reward_risk_min: 1.5
+    risk_per_trade_pct: 1.5
+    theta_timeout_minutes: 60
+  trending:
+    confidence_threshold: 0.62
+    daily_max_loss_pct: 3.0
+    min_delta: 0.4
+    reward_risk_min: 1.8
+    risk_per_trade_pct: 2.0
+    theta_timeout_minutes: 90
+risk:
+  daily_max_loss_pct: 1.0
+  daily_profit_target_pct: 2.5
+  max_open_positions: 1
+  reward_risk_min: 2.5
+  risk_per_trade_pct: 1.0
+  squareoff_time: '15:15'
+  theta_timeout_minutes: 45

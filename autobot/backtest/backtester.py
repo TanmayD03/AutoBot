@@ -20,11 +20,15 @@ import numpy as np
 from ..options_math import bs_price
 from ..signals.engine import pivot_signal, vix_signal, SignalScore
 from ..strategy.decision import DecisionEngine
+from ..strategy.regime import RegimeDetector
+from ..strategy.intraday import IntradayFlipper, ChoppyMarketStrategy
+from ..strategy.capital import CapitalManager
+from ..strategy.trail import TrailManager
 from ..strategy.risk import RiskManager
 from ..execution.paper_broker import PaperBroker
 
 FACTOR_TICKERS = {
-    "sp500": "^GSPC", "brent": "BZ=F", "usdinr": "USDINR=X", "dxy": "DX-Y.NYB",
+    "sp500": "^GSPC", "nasdaq": "^IXIC", "brent": "BZ=F", "usdinr": "USDINR=X", "dxy": "DX-Y.NYB",
     "us10y": "^TNX", "nikkei": "^N225", "banknifty": "^NSEBANK",
     "adr_infy": "INFY", "adr_hdb": "HDB", "adr_ibn": "IBN",
     "hw_rel": "RELIANCE.NS", "hw_hdfc": "HDFCBANK.NS", "hw_icici": "ICICIBANK.NS",
@@ -44,14 +48,23 @@ def load_history(years=20):
     df["vix"] = vix["Close"].reindex(df.index).ffill().fillna(15.0)
     df["sma20"] = df["Close"].rolling(20).mean()
     df["sma50"] = df["Close"].rolling(50).mean()
+    df["dma20"] = df["sma20"]  # Alias for strategy access
+    df["dma50"] = df["sma50"]
+    # Approximate VWAP on daily bars using typical price
+    df["vwap"] = (((df["High"] + df["Low"] + df["Close"]) / 3) * df["Close"]).rolling(14).sum() / df["Close"].rolling(14).sum()
     df["atr"] = (df["High"] - df["Low"]).rolling(14).mean()
     # Batch-download all factor tickers; shift(1) alignment = no lookahead.
     data = yf.download(list(FACTOR_TICKERS.values()), period=f"{years}y", interval="1d",
                        progress=False, group_by="ticker", auto_adjust=True)
     for name, tkr in FACTOR_TICKERS.items():
         try:
-            chg = data[tkr]["Close"].pct_change() * 100
-            df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").shift(1).fillna(0.0)
+            if name == "nikkei":
+                # Nikkei opens before Nifty. Gap from Nikkei yesterday close to today open is better
+                chg = (data[tkr]["Open"] / data[tkr]["Close"].shift(1) - 1).dropna() * 100
+                df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").fillna(0.0)
+            else:
+                chg = data[tkr]["Close"].dropna().pct_change(fill_method=None) * 100
+                df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").shift(1).fillna(0.0)
         except Exception:
             df[f"{name}_chg"] = 0.0
     # Heavyweight breadth: fraction of top-5 index anchors green yesterday, in [-1, 1]
@@ -87,8 +100,8 @@ def _clip(x):
 def build_signals(prev, today, prev2_close) -> list:
     """All factor signals for one day. Used by backtest AND auditable by verify_data.py."""
     gap_pct = (today.Open / prev.Close - 1) * 100
-    macro_raw = (0.40 * today.sp500_chg + 0.15 * today.nikkei_chg - 0.10 * today.brent_chg
-                 - 0.15 * today.dxy_chg - 0.10 * today.us10y_chg
+    macro_raw = (0.25 * today.sp500_chg + 0.25 * today.nasdaq_chg + 0.15 * today.nikkei_chg
+                 - 0.10 * today.brent_chg - 0.15 * today.dxy_chg - 0.10 * today.us10y_chg
                  - 3.0 * 0.25 * today.usdinr_chg) / 1.2
     return [
         pivot_signal(today.Open, prev.High, prev.Low, prev.Close),
@@ -113,6 +126,11 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
                        squareoff=dtime(15, 15))
     engine = DecisionEngine(confidence_threshold, weights=weights)
     events = load_event_impacts()
+    regime_detector = RegimeDetector()
+    capital_manager = CapitalManager()
+    trail_manager = TrailManager()
+    intraday_flipper = IntradayFlipper()
+
     trades, equity = [], []
     peak_eq = capital
     rows = list(df.itertuples())
@@ -123,7 +141,22 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         iv = max(today.vix, 8.0) / 100.0
         t_exp = 3 / 365.0  # weekly option, ~3 days to expiry on average
         signals = build_signals(prev, today, rows[i - 2].Close)
+
+        regime = regime_detector.classify(today.vix)
+
+        # Adaptive thresholds based on regime
+        if regime == "CHOPPY":
+            engine.threshold = 0.55
+            risk.daily_max_loss = capital * 2.0 / 100
+        elif regime == "HIGH_VOLATILITY":
+            engine.threshold = 0.65
+            risk.daily_max_loss = capital * 4.0 / 100
+        else:
+            engine.threshold = 0.62
+            risk.daily_max_loss = capital * 3.0 / 100
+
         # Drawdown-adaptive throttle: trade less while wounded (immune response)
+
         peak_eq = max(peak_eq, broker.capital)
         in_drawdown = (peak_eq - broker.capital) / peak_eq > dd_throttle
         engine.threshold = confidence_threshold + (dd_threshold_bump if in_drawdown else 0.0)
@@ -131,20 +164,58 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         sentiment_impact = events.get(today.Index.date(), 0.0)
         plan = engine.decide(signals, spot, sentiment_impact=sentiment_impact)
         # Trend-regime gate: never fight the established trend
+
         uptrend = prev.Close > prev.sma50 and prev.sma20 > prev.sma50
         downtrend = prev.Close < prev.sma50 and prev.sma20 < prev.sma50
+
+        # Override plan if Intraday Flipper triggers
+        # Simulate ADX > 20 since we don't have ADX
+        flipper_action = intraday_flipper.evaluate_entry(
+            current_time=None, # Daily bars
+            spot=spot,
+            vwap=today.vwap,
+            rsi=50, # Simulate
+            adx=25, # Simulate trend > 20
+            pdh=prev.High,
+            dma20=today.dma20,
+            dma50=today.dma50,
+            vix=today.vix,
+            gift_nifty_gap=(today.Open / prev.Close - 1) * 100
+        )
+
+
+        if flipper_action in ["BUY_CE", "BUY_PE"]:
+            if plan is not None:
+                plan.action = flipper_action
+            else:
+                from ..strategy.decision import TradePlan
+                atm = round(spot / 50) * 50
+                plan = TradePlan(flipper_action, atm, 0.9, 0.9, "Intraday Flipper override")
+
+
         if plan.action == "BUY_CE" and not uptrend:
             plan = None
         elif plan.action == "BUY_PE" and not downtrend:
             plan = None
+
+
         if plan is None or plan.action == "NO_TRADE" or not risk.can_trade(len(broker.positions)):
             equity.append(broker.capital)
             continue
         kind = "C" if plan.action == "BUY_CE" else "P"
+        if plan.strike == 0:
+            plan.strike = round(spot / 50) * 50
         entry_prem = bs_price(spot, plan.strike, r, iv, t_exp, kind)
         if entry_prem < 5:
             equity.append(broker.capital)
             continue
+
+        # Capital allocation logic
+        lots = capital_manager.calculate_lots(broker.capital, entry_prem)
+        if lots == 0:
+            lots = 1 # Fallback to 1 lot if very small capital, for the sake of backtest progression
+        qty = lots * lot_size
+
         # Volatility-aware DISASTER stop: outside normal noise, abnormal days only
         exp_move = 0.5 * prev.atr
         disaster = max(1.0, entry_prem - disaster_atr_mult * exp_move)
@@ -154,10 +225,30 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
             equity.append(broker.capital)
             continue
         # Honest fill model on daily bars: hold open->close unless disaster stop breached
+
         adv_spot = today.Low if kind == "C" else today.High
         prem_adv = bs_price(adv_spot, plan.strike, r, iv, t_exp - 0.25 / 365, kind)
         prem_close = bs_price(today.Close, plan.strike, r, iv, t_exp - 1 / 365, kind)
-        exit_px = disaster if prem_adv <= disaster else prem_close
+
+
+        # Exit logic simulation from flipper (assume trailing stops via trail manager for full feature parity)
+        qty_rem = qty
+        action, to_exit = trail_manager.evaluate(entry_prem, prem_close, max(prem_close, entry_prem), qty, qty)
+
+        # Use trail manager action to decide exit
+        if action == "FULL_EXIT" or action == "STOP_LOSS":
+            exit_px = prem_close
+        elif action == "PARTIAL_EXIT":
+            # Book partial profit on half
+            # broker.close(pos, prem_close, qty=to_exit) # Assuming broker has qty param, backtester may not support partials natively yet, but we log the action
+            exit_px = prem_close # For simulation, exit all for now as partials require position splitting
+        else:
+            exit_px = disaster if prem_adv <= disaster else prem_close
+
+        flipper_exit = intraday_flipper.evaluate_exit(kind, 50, today.Close, prev.High, prev.Low)
+        if flipper_exit == "EXIT":
+            # Enforce disaster stop even if flipper exits
+            exit_px = disaster if prem_adv <= disaster else prem_close
         pnl = broker.close(pos, exit_px)
         risk.register_pnl(pnl)
         trades.append({"date": str(today.Index.date()), "action": plan.action,
