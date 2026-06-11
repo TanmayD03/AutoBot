@@ -20,6 +20,10 @@ import numpy as np
 from ..options_math import bs_price
 from ..signals.engine import pivot_signal, vix_signal, SignalScore
 from ..strategy.decision import DecisionEngine
+from ..strategy.regime import RegimeDetector
+from ..strategy.intraday import IntradayFlipper, ChoppyMarketStrategy
+from ..strategy.capital import CapitalManager
+from ..strategy.trail import TrailManager
 from ..strategy.risk import RiskManager
 from ..execution.paper_broker import PaperBroker
 
@@ -118,6 +122,10 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
                        squareoff=dtime(15, 15))
     engine = DecisionEngine(confidence_threshold, weights=weights)
     events = load_event_impacts()
+    regime_detector = RegimeDetector()
+    capital_manager = CapitalManager()
+    trail_manager = TrailManager()
+
     trades, equity = [], []
     peak_eq = capital
     rows = list(df.itertuples())
@@ -128,7 +136,22 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         iv = max(today.vix, 8.0) / 100.0
         t_exp = 3 / 365.0  # weekly option, ~3 days to expiry on average
         signals = build_signals(prev, today, rows[i - 2].Close)
+
+        regime = regime_detector.classify(today.vix)
+
+        # Adaptive thresholds based on regime
+        if regime == "CHOPPY":
+            engine.threshold = 0.55
+            risk.daily_max_loss = capital * 2.0 / 100
+        elif regime == "HIGH_VOLATILITY":
+            engine.threshold = 0.65
+            risk.daily_max_loss = capital * 4.0 / 100
+        else:
+            engine.threshold = 0.62
+            risk.daily_max_loss = capital * 3.0 / 100
+
         # Drawdown-adaptive throttle: trade less while wounded (immune response)
+
         peak_eq = max(peak_eq, broker.capital)
         in_drawdown = (peak_eq - broker.capital) / peak_eq > dd_throttle
         engine.threshold = confidence_threshold + (dd_threshold_bump if in_drawdown else 0.0)
@@ -142,6 +165,7 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
             plan = None
         elif plan.action == "BUY_PE" and not downtrend:
             plan = None
+
         if plan is None or plan.action == "NO_TRADE" or not risk.can_trade(len(broker.positions)):
             equity.append(broker.capital)
             continue
@@ -150,6 +174,13 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         if entry_prem < 5:
             equity.append(broker.capital)
             continue
+
+        # Capital allocation logic
+        lots = capital_manager.calculate_lots(broker.capital, entry_prem)
+        if lots == 0:
+            lots = 1 # Fallback to 1 lot if very small capital, for the sake of backtest progression
+        qty = lots * lot_size
+
         # Volatility-aware DISASTER stop: outside normal noise, abnormal days only
         exp_move = 0.5 * prev.atr
         disaster = max(1.0, entry_prem - disaster_atr_mult * exp_move)
