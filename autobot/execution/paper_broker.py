@@ -13,6 +13,7 @@ class Position:
     stop: float
     target: float
     direction: int = 1  # long premium
+    entry_charges: float = 0.0
 
 
 @dataclass
@@ -49,7 +50,7 @@ class PaperBroker:
         if cost + ch > self.capital:
             return None
         self.capital -= cost + ch
-        pos = Position(symbol, qty, px, stop, target)
+        pos = Position(symbol, qty, px, stop, target, entry_charges=ch)
         self.positions.append(pos)
         self.fills.append(Fill(symbol, qty, px, "BUY", ch))
         return pos
@@ -59,7 +60,7 @@ class PaperBroker:
         proceeds = px * pos.qty
         ch = self.charges(proceeds, sell_side=True)
         self.capital += proceeds - ch
-        pnl = (px - pos.entry) * pos.qty - ch
+        pnl = (px - pos.entry) * pos.qty - ch - pos.entry_charges
         self.realized_pnl += pnl
         self.fills.append(Fill(pos.symbol, pos.qty, px, "SELL", ch))
         self.positions.remove(pos)
