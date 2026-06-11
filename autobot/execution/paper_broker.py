@@ -1,9 +1,5 @@
-"""PaperBroker — default execution venue. Realistic fills with slippage and
-Indian F&O cost model (brokerage, STT, exchange charges, GST, stamp duty approximation).
-"""
 from dataclasses import dataclass
 from typing import List
-
 
 @dataclass
 class Position:
@@ -15,38 +11,33 @@ class Position:
     direction: int = 1  # long premium
     entry_charges: float = 0.0
 
-
 @dataclass
 class Fill:
     symbol: str
     qty: int
-    price: float
+    px: float
     side: str
     charges: float
 
-
 class PaperBroker:
-    SLIPPAGE_PCT = 0.05 / 100
-
-    def __init__(self, capital=100000.0):
+    def __init__(self, capital: float):
         self.capital = capital
         self.positions: List[Position] = []
         self.fills: List[Fill] = []
         self.realized_pnl = 0.0
 
-    @staticmethod
-    def charges(turnover, sell_side=False):
-        brokerage = min(20.0, turnover * 0.0003)
-        stt = turnover * 0.000625 if sell_side else 0.0
-        exch = turnover * 0.00035
-        gst = (brokerage + exch) * 0.18
-        stamp = turnover * 0.00003 if not sell_side else 0.0
-        return brokerage + stt + exch + gst + stamp
+    def charges(self, proceeds: float, sell_side: bool = False) -> float:
+        """Estimate NSE F&O transaction + regulatory + GST + STT costs."""
+        c = 20.0  # Flat brokerage
+        c += proceeds * 0.0005  # Exchange tx charge ~0.05%
+        c += (c * 0.18)         # GST
+        if sell_side:
+            c += proceeds * 0.000625  # STT (sell only, 0.0625%)
+        return c
 
-    def buy(self, symbol, qty, price, stop, target):
-        px = price * (1 + self.SLIPPAGE_PCT)
+    def buy(self, symbol: str, qty: int, px: float, stop: float, target: float):
         cost = px * qty
-        ch = self.charges(cost)
+        ch = self.charges(cost, sell_side=False)
         if cost + ch > self.capital:
             return None
         self.capital -= cost + ch
@@ -55,8 +46,7 @@ class PaperBroker:
         self.fills.append(Fill(symbol, qty, px, "BUY", ch))
         return pos
 
-    def close(self, pos: Position, price):
-        px = price * (1 - self.SLIPPAGE_PCT)
+    def close(self, pos: Position, px: float):
         proceeds = px * pos.qty
         ch = self.charges(proceeds, sell_side=True)
         self.capital += proceeds - ch

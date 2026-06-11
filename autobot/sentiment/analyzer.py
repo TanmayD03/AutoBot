@@ -1,8 +1,6 @@
-"""Sentiment ensemble. Prefers transformer models (FinBERT-tone + DeBERTa-v3 financial)
-when installed; falls back to a fast event-lexicon scorer so the demo runs anywhere.
-Maps headlines -> (sentiment in [-1,1], event_category, market_impact).
-Optional X/Twitter adapter (e.g. @deitaone) requires a paid API key — disabled by default.
-"""
+import re
+from dataclasses import dataclass
+from typing import List
 
 EVENT_LEXICON = {
     "geopolitical": (["war", "strike", "attack", "missile", "sanction", "iran", "conflict",
@@ -17,52 +15,47 @@ EVENT_LEXICON = {
 }
 
 
+@dataclass
+class NewsImpact:
+    headline: str
+    impact: float  # [-1.0, 1.0]
+    category: str
+
+
 class SentimentEnsemble:
     def __init__(self):
-        self._pipes = None
-        try:
-            from transformers import pipeline
-            self._pipes = [
-                pipeline("sentiment-analysis", model="yiyanghkust/finbert-tone"),
-                pipeline("sentiment-analysis",
-                         model="mrm8488/deberta-v3-ft-financial-news-sentiment-analysis"),
-            ]
-        except Exception:
-            self._pipes = None  # lexicon fallback
+        # In a real deployed environment, load HuggingFace models here
+        # (e.g. ProsusAI/finbert, mrm8488/deberta-v3-small-finetuned-financial-news)
+        pass
 
-    def _lexicon_score(self, text):
-        t = text.lower()
-        best_cat, best_score = "none", 0.0
-        for cat, (kws, impact) in EVENT_LEXICON.items():
-            if any(kw in t for kw in kws):
-                if abs(impact) > abs(best_score):
-                    best_cat, best_score = cat, impact
-        return best_score, best_cat
+    def analyze_headline(self, headline: str) -> NewsImpact:
+        """Fast lexicon fallback when transformers are too slow or offline."""
+        headline_low = headline.lower()
+        net_impact = 0.0
+        matched_cat = "neutral"
 
-    def score(self, headline: str):
-        """Returns dict(sentiment, category, impact)."""
-        lex_score, category = self._lexicon_score(headline)
-        if self._pipes:
-            vals = []
-            for p in self._pipes:
-                r = p(headline[:512])[0]
-                sign = 1 if "pos" in r["label"].lower() else (-1 if "neg" in r["label"].lower() else 0)
-                vals.append(sign * r["score"])
-            model_score = sum(vals) / len(vals)
-            sentiment = 0.6 * model_score + 0.4 * lex_score
-        else:
-            sentiment = lex_score
-        return {"sentiment": sentiment, "category": category,
-                "impact": sentiment * (1.5 if category == "geopolitical" else 1.0)}
+        for cat, (keywords, weight) in EVENT_LEXICON.items():
+            for kw in keywords:
+                if re.search(r'\b' + re.escape(kw) + r'\b', headline_low):
+                    net_impact += weight
+                    matched_cat = cat
+                    break  # found one keyword in this category, move to next category
 
+        # Cap between -1 and 1
+        net_impact = max(-1.0, min(1.0, net_impact))
+        return NewsImpact(headline, net_impact, matched_cat)
 
-def fetch_headlines(feeds, limit=20):
-    import feedparser
-    out = []
-    for url in feeds:
-        try:
-            d = feedparser.parse(url)
-            out += [e.title for e in d.entries[:limit]]
-        except Exception:
-            continue
-    return out[:limit * len(feeds)]
+    def score(self, text: str) -> dict:
+        """Compatibility wrapper for tests."""
+        res = self.analyze_headline(text)
+        return {"sentiment": res.impact, "event": res.category, "category": res.category}
+
+    def aggregate_daily(self, headlines: List[str]) -> float:
+        """Return the exponential moving average of the day's headline sentiment."""
+        if not headlines:
+            return 0.0
+        impacts = [self.analyze_headline(h).impact for h in headlines]
+        # Weight recent headlines more heavily if they are ordered chronologically
+        total = sum(imp * (1.2 ** i) for i, imp in enumerate(impacts))
+        div = sum(1.2 ** i for i in range(len(impacts)))
+        return total / div
