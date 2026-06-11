@@ -1,0 +1,12 @@
+numpy>=1.24
+pandas>=2.0
+yfinance>=0.2.40
+requests>=2.31
+feedparser>=6.0
+rich>=13.0
+PyYAML>=6.0
+pytest>=7.0
+# Optional heavy deps (sentiment transformers). Demo works without them.
+# transformers>=4.40
+# torch
+# neo-api-client  # Kotak Neo official SDK (live mode only)
