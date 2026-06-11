@@ -7,7 +7,8 @@
 from autobot.backtest.backtester import load_history, run_backtest, fitness_for_pso
 from autobot.nature.pso import PSO
 
-SIGNAL_NAMES = ["pivots", "vix", "gift_gap", "momentum", "macro"]
+SIGNAL_NAMES = ["pivots", "vix", "gift_gap", "momentum", "macro",
+                "sector", "breadth", "adr"]
 
 
 def show(rep, title):

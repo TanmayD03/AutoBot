@@ -1,26 +1,37 @@
-"""Event-driven backtester v4.
+"""Event-driven backtester v5.
 Replays NIFTY daily history through the SAME signal/decision/risk code used live.
 Option premiums reconstructed with Black-Scholes using India VIX as IV proxy.
 
-v4 changes (full factor mapping):
-- Global macro factors merged into the historical dataset: S&P 500, Brent crude and
-  USD/INR daily changes, SHIFTED BY ONE DAY so the simulation only knows what a trader
-  would actually know at the 09:15 IST open (no lookahead bias).
-- Event-sentiment backtesting: curated major events (events.csv) inject a decaying
-  market-impact score into the decision engine, validating news->market mapping.
-- Drawdown-adaptive confidence throttle: when equity is >10% below its peak, the
-  confidence gate tightens (+0.07), so the system trades less while wounded.
-(v3) ATR disaster stops + honest open-to-close fills. (v2) k-fold walk-forward fitness.
+v5: ALL free historical factors mapped (Yahoo Finance, up to 20y daily, lookahead-safe):
+- Global: S&P 500, Nikkei, Brent, DXY, US 10Y yield, USD/INR
+- India structure: Bank Nifty (sector alignment), top-5 heavyweight breadth
+  (RELIANCE/HDFCBANK/ICICIBANK/INFY/TCS), Indian ADRs (INFY/HDB/IBN)
+Every factor is shift(1)-aligned: the simulation only knows yesterday's close at
+today's 09:15 IST open. Run `python verify_data.py` to audit the mapping.
+
+Still NOT freely available historically (live-only, paid-vendor adapter slots exist):
+strike-level option chain OI/PCR/GEX, FII/DII flows, intraday ticks, GIFT Nifty.
 """
 import csv
 import math
 import os
 from datetime import datetime, time as dtime, timedelta
+import numpy as np
 from ..options_math import bs_price
 from ..signals.engine import pivot_signal, vix_signal, SignalScore
 from ..strategy.decision import DecisionEngine
 from ..strategy.risk import RiskManager
 from ..execution.paper_broker import PaperBroker
+
+FACTOR_TICKERS = {
+    "sp500": "^GSPC", "brent": "BZ=F", "usdinr": "USDINR=X", "dxy": "DX-Y.NYB",
+    "us10y": "^TNX", "nikkei": "^N225", "banknifty": "^NSEBANK",
+    "adr_infy": "INFY", "adr_hdb": "HDB", "adr_ibn": "IBN",
+    "hw_rel": "RELIANCE.NS", "hw_hdfc": "HDFCBANK.NS", "hw_icici": "ICICIBANK.NS",
+    "hw_infy": "INFY.NS", "hw_tcs": "TCS.NS",
+}
+HW_COLS = ["hw_rel_chg", "hw_hdfc_chg", "hw_icici_chg", "hw_infy_chg", "hw_tcs_chg"]
+ADR_COLS = ["adr_infy_chg", "adr_hdb_chg", "adr_ibn_chg"]
 
 
 def load_history(years=20):
@@ -34,16 +45,19 @@ def load_history(years=20):
     df["sma20"] = df["Close"].rolling(20).mean()
     df["sma50"] = df["Close"].rolling(50).mean()
     df["atr"] = (df["High"] - df["Low"]).rolling(14).mean()
-    # Global macro factors. shift(1) after alignment = only yesterday's close is known
-    # at today's Indian open (US session ends ~02:30 IST). No lookahead.
-    for name, tkr in (("sp500", "^GSPC"), ("brent", "BZ=F"), ("usdinr", "USDINR=X")):
+    # Batch-download all factor tickers; shift(1) alignment = no lookahead.
+    data = yf.download(list(FACTOR_TICKERS.values()), period=f"{years}y", interval="1d",
+                       progress=False, group_by="ticker", auto_adjust=True)
+    for name, tkr in FACTOR_TICKERS.items():
         try:
-            s = yf.download(tkr, period=f"{years}y", interval="1d", progress=False, auto_adjust=True)
-            s.columns = [c[0] if isinstance(c, tuple) else c for c in s.columns]
-            chg = s["Close"].pct_change() * 100
+            chg = data[tkr]["Close"].pct_change() * 100
             df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").shift(1).fillna(0.0)
         except Exception:
             df[f"{name}_chg"] = 0.0
+    # Heavyweight breadth: fraction of top-5 index anchors green yesterday, in [-1, 1]
+    df["hw_breadth"] = sum(np.sign(df[c]) for c in HW_COLS) / len(HW_COLS)
+    # ADR composite: average prev-day move of Indian ADRs in the US session
+    df["adr_chg"] = sum(df[c] for c in ADR_COLS) / len(ADR_COLS)
     return df.dropna()
 
 
@@ -66,12 +80,26 @@ def load_event_impacts():
     return impacts
 
 
-def macro_signal(row) -> SignalScore:
-    """Overnight macro bias from yesterday's S&P 500 (+), Brent (-) and USD/INR (-).
-    USD/INR scaled x3 because currency moves are small but high-impact (FII flows)."""
-    raw = (0.55 * row.sp500_chg - 0.15 * row.brent_chg - 3.0 * 0.35 * row.usdinr_chg) / 1.2
-    score = max(-1.0, min(1.0, raw))
-    return SignalScore("macro", score, 0.6)
+def _clip(x):
+    return max(-1.0, min(1.0, x))
+
+
+def build_signals(prev, today, prev2_close) -> list:
+    """All factor signals for one day. Used by backtest AND auditable by verify_data.py."""
+    gap_pct = (today.Open / prev.Close - 1) * 100
+    macro_raw = (0.40 * today.sp500_chg + 0.15 * today.nikkei_chg - 0.10 * today.brent_chg
+                 - 0.15 * today.dxy_chg - 0.10 * today.us10y_chg
+                 - 3.0 * 0.25 * today.usdinr_chg) / 1.2
+    return [
+        pivot_signal(today.Open, prev.High, prev.Low, prev.Close),
+        vix_signal(today.vix, (today.vix / prev.vix - 1) * 100 if prev.vix else 0),
+        SignalScore("gift_gap", _clip(gap_pct), 0.7),
+        SignalScore("momentum", _clip((prev.Close / prev2_close - 1) * 100 / 1.2), 0.5),
+        SignalScore("macro", _clip(macro_raw), 0.6),
+        SignalScore("sector", _clip(today.banknifty_chg / 1.2), 0.55),   # Bank Nifty alignment
+        SignalScore("breadth", _clip(today.hw_breadth * 0.8), 0.55),     # heavyweight breadth
+        SignalScore("adr", _clip(today.adr_chg / 1.5), 0.6),             # ADR overnight read
+    ]
 
 
 def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.068,
@@ -94,19 +122,12 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         spot = today.Open
         iv = max(today.vix, 8.0) / 100.0
         t_exp = 3 / 365.0  # weekly option, ~3 days to expiry on average
-        gap_pct = (today.Open / prev.Close - 1) * 100
-        signals = [
-            pivot_signal(spot, prev.High, prev.Low, prev.Close),
-            vix_signal(today.vix, (today.vix / prev.vix - 1) * 100 if prev.vix else 0),
-            SignalScore("gift_gap", max(-1, min(1, gap_pct)), 0.7),
-            SignalScore("momentum", max(-1, min(1, (prev.Close / rows[i - 2].Close - 1) * 100 / 1.2)), 0.5),
-            macro_signal(today),
-        ]
+        signals = build_signals(prev, today, rows[i - 2].Close)
         # Drawdown-adaptive throttle: trade less while wounded (immune response)
         peak_eq = max(peak_eq, broker.capital)
         in_drawdown = (peak_eq - broker.capital) / peak_eq > dd_throttle
         engine.threshold = confidence_threshold + (dd_threshold_bump if in_drawdown else 0.0)
-        # Event sentiment: decaying impact of major historical news on/after event dates
+        # Event sentiment: decaying impact of major historical news
         sentiment_impact = events.get(today.Index.date(), 0.0)
         plan = engine.decide(signals, spot, sentiment_impact=sentiment_impact)
         # Trend-regime gate: never fight the established trend
@@ -174,10 +195,7 @@ def report(trades, equity, capital):
 
 
 def fitness_for_pso(df, names, folds=3):
-    """K-fold walk-forward fitness: weights must hold up across multiple regimes.
-    fitness = mean(expectancy across folds) - std(expectancy) - 0.3*mean(drawdown).
-    Any fold with too few trades disqualifies the particle.
-    """
+    """K-fold walk-forward fitness: weights must hold up across multiple regimes."""
     n = len(df)
     chunks = [df.iloc[int(n * k / folds):int(n * (k + 1) / folds)] for k in range(folds)]
 
