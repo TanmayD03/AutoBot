@@ -35,7 +35,7 @@ def main():
 
     print("\nPREDICTIVE SANITY (overnight factor -> NIFTY opening gap):")
     gap = (df["Open"] / df["Close"].shift(1) - 1) * 100
-    for c in ("sp500_chg", "adr_chg", "nikkei_chg"):
+    for c in ("sp500_chg", "nasdaq_chg", "adr_chg", "nikkei_chg"):
         corr = float(df[c].corr(gap))
         print(f"  corr({c}, next open gap) = {corr:+.3f}"
               + ("  OK (positive lead)" if corr > 0.05 else "  WEAK"))

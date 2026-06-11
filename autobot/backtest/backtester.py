@@ -24,7 +24,7 @@ from ..strategy.risk import RiskManager
 from ..execution.paper_broker import PaperBroker
 
 FACTOR_TICKERS = {
-    "sp500": "^GSPC", "brent": "BZ=F", "usdinr": "USDINR=X", "dxy": "DX-Y.NYB",
+    "sp500": "^GSPC", "nasdaq": "^IXIC", "brent": "BZ=F", "usdinr": "USDINR=X", "dxy": "DX-Y.NYB",
     "us10y": "^TNX", "nikkei": "^N225", "banknifty": "^NSEBANK",
     "adr_infy": "INFY", "adr_hdb": "HDB", "adr_ibn": "IBN",
     "hw_rel": "RELIANCE.NS", "hw_hdfc": "HDFCBANK.NS", "hw_icici": "ICICIBANK.NS",
@@ -50,8 +50,13 @@ def load_history(years=20):
                        progress=False, group_by="ticker", auto_adjust=True)
     for name, tkr in FACTOR_TICKERS.items():
         try:
-            chg = data[tkr]["Close"].dropna().pct_change(fill_method=None) * 100
-            df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").shift(1).fillna(0.0)
+            if name == "nikkei":
+                # Nikkei opens before Nifty. Gap from Nikkei yesterday close to today open is better
+                chg = (data[tkr]["Open"] / data[tkr]["Close"].shift(1) - 1).dropna() * 100
+                df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").fillna(0.0)
+            else:
+                chg = data[tkr]["Close"].dropna().pct_change(fill_method=None) * 100
+                df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").shift(1).fillna(0.0)
         except Exception:
             df[f"{name}_chg"] = 0.0
     # Heavyweight breadth: fraction of top-5 index anchors green yesterday, in [-1, 1]
@@ -87,8 +92,8 @@ def _clip(x):
 def build_signals(prev, today, prev2_close) -> list:
     """All factor signals for one day. Used by backtest AND auditable by verify_data.py."""
     gap_pct = (today.Open / prev.Close - 1) * 100
-    macro_raw = (0.40 * today.sp500_chg + 0.15 * today.nikkei_chg - 0.10 * today.brent_chg
-                 - 0.15 * today.dxy_chg - 0.10 * today.us10y_chg
+    macro_raw = (0.25 * today.sp500_chg + 0.25 * today.nasdaq_chg + 0.15 * today.nikkei_chg
+                 - 0.10 * today.brent_chg - 0.15 * today.dxy_chg - 0.10 * today.us10y_chg
                  - 3.0 * 0.25 * today.usdinr_chg) / 1.2
     return [
         pivot_signal(today.Open, prev.High, prev.Low, prev.Close),
