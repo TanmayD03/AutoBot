@@ -1,15 +1,17 @@
-"""Event-driven backtester v2.
+"""Event-driven backtester v3.
 Replays NIFTY daily history through the SAME signal/decision/risk code used live.
 Option premiums reconstructed with Black-Scholes using India VIX as IV proxy.
 
-v2 changes (anti-overfitting + correct risk units):
-- Percent-of-capital risk: stop/target derived from risk_per_trade_pct, so daily limits
-  and lot size are consistent. (A fixed 20-rupee daily cap is impossible with a 75-qty
-  lot where 1 index point = 75 rupees.)
-- Trend-regime filter: CE only in confirmed uptrends (price>SMA50 and SMA20>SMA50),
-  PE only in confirmed downtrends. Cuts counter-trend whipsaw losses.
-- K-fold walk-forward PSO fitness: weights must work across multiple market regimes,
-  not one lucky window (mean expectancy across folds minus dispersion penalty).
+v3 changes (volatility-aware exits + honest fill model):
+- v2's percent-of-capital stops produced ~13-point stops on ~180-point premiums while
+  ATM premiums swing 50-80 points intraday -> stops sat inside market noise and the
+  conservative stop-first fill rule stopped out 100% of trades. Structural flaw, fixed.
+- Exits are now ATR-based: a DISASTER stop at 2x the expected daily premium move
+  (delta ~0.5 x ATR), which only triggers on abnormal adverse days.
+- Baseline fill is open-to-close hold: the only execution daily OHLC bars can model
+  honestly (intraday stop/target ordering is unknowable from daily data).
+- Reality check: 1 NIFTY lot (75 qty) at 100k capital implies ~2-4% effective risk per
+  trade. That is the physical minimum; tighter is noise, not risk management.
 """
 import math
 from datetime import time as dtime
@@ -30,17 +32,18 @@ def load_history(years=20):
     df["vix"] = vix["Close"].reindex(df.index).ffill().fillna(15.0)
     df["sma20"] = df["Close"].rolling(20).mean()
     df["sma50"] = df["Close"].rolling(50).mean()
+    df["atr"] = (df["High"] - df["Low"]).rolling(14).mean()
     return df.dropna()
 
 
 def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.068,
-                 confidence_threshold=0.70, risk_per_trade_pct=1.0,
-                 daily_max_loss_pct=1.0, daily_profit_target_pct=2.5, rr=2.5):
+                 confidence_threshold=0.70, daily_max_loss_pct=3.0,
+                 daily_profit_target_pct=7.5, disaster_atr_mult=2.0):
     qty = lots * lot_size
     broker = PaperBroker(capital)
     risk = RiskManager(daily_profit_target=capital * daily_profit_target_pct / 100,
                        daily_max_loss=capital * daily_max_loss_pct / 100,
-                       reward_risk_min=rr, squareoff=dtime(15, 15))
+                       squareoff=dtime(15, 15))
     engine = DecisionEngine(confidence_threshold, weights=weights)
     trades, equity = [], []
     rows = list(df.itertuples())
@@ -73,29 +76,21 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         if entry_prem < 5:
             equity.append(broker.capital)
             continue
-        # Percent-of-capital risk: consistent units between stop, target and kill switch
-        risk_points = max(2.0, (broker.capital * risk_per_trade_pct / 100) / qty)
-        stop = max(0.5, entry_prem - risk_points)
-        target = entry_prem + rr * risk_points
-        if not risk.validate_trade(entry_prem, stop, target):
-            equity.append(broker.capital)
-            continue
-        pos = broker.buy(f"NIFTY{plan.strike}{kind}E", qty, entry_prem, stop, target)
+        # Volatility-aware DISASTER stop: 2x expected daily premium move (delta~0.5 x ATR).
+        # Sits outside normal noise; only abnormal adverse days trigger it.
+        exp_move = 0.5 * prev.atr
+        disaster = max(1.0, entry_prem - disaster_atr_mult * exp_move)
+        pos = broker.buy(f"NIFTY{plan.strike}{kind}E", qty, entry_prem, disaster,
+                         entry_prem + disaster_atr_mult * exp_move * 2.5)
         if pos is None:
             equity.append(broker.capital)
             continue
-        # Intraday path approximation at the day's extremes (stop checked first: conservative)
-        fav_spot = today.High if kind == "C" else today.Low
+        # Honest fill model on daily bars: hold open->close (EOD square-off).
+        # Only exception: adverse extreme breaches the disaster stop.
         adv_spot = today.Low if kind == "C" else today.High
-        prem_fav = bs_price(fav_spot, plan.strike, r, iv, t_exp - 0.25 / 365, kind)
         prem_adv = bs_price(adv_spot, plan.strike, r, iv, t_exp - 0.25 / 365, kind)
         prem_close = bs_price(today.Close, plan.strike, r, iv, t_exp - 1 / 365, kind)
-        if prem_adv <= pos.stop:
-            exit_px = pos.stop
-        elif prem_fav >= pos.target:
-            exit_px = pos.target
-        else:
-            exit_px = prem_close
+        exit_px = disaster if prem_adv <= disaster else prem_close
         pnl = broker.close(pos, exit_px)
         risk.register_pnl(pnl)
         trades.append({"date": str(today.Index.date()), "action": plan.action,
