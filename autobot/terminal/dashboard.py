@@ -54,6 +54,11 @@ class Dashboard:
         layout["bottom"].update(footer)
         return layout
 
+    def snapshot(self):
+        """One-shot render for notebooks (Colab), where Live loops cannot display."""
+        from rich.console import Console
+        Console().print(self.render())
+
     def run(self, update_fn=None, refresh=2.0):
         with Live(self.render(), refresh_per_second=2) as live:
             while True:
