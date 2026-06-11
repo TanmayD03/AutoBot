@@ -50,7 +50,7 @@ def load_history(years=20):
                        progress=False, group_by="ticker", auto_adjust=True)
     for name, tkr in FACTOR_TICKERS.items():
         try:
-            chg = data[tkr]["Close"].pct_change() * 100
+            chg = data[tkr]["Close"].dropna().pct_change(fill_method=None) * 100
             df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").shift(1).fillna(0.0)
         except Exception:
             df[f"{name}_chg"] = 0.0
