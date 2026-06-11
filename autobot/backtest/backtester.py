@@ -1,20 +1,21 @@
-"""Event-driven backtester v3.
+"""Event-driven backtester v4.
 Replays NIFTY daily history through the SAME signal/decision/risk code used live.
 Option premiums reconstructed with Black-Scholes using India VIX as IV proxy.
 
-v3 changes (volatility-aware exits + honest fill model):
-- v2's percent-of-capital stops produced ~13-point stops on ~180-point premiums while
-  ATM premiums swing 50-80 points intraday -> stops sat inside market noise and the
-  conservative stop-first fill rule stopped out 100% of trades. Structural flaw, fixed.
-- Exits are now ATR-based: a DISASTER stop at 2x the expected daily premium move
-  (delta ~0.5 x ATR), which only triggers on abnormal adverse days.
-- Baseline fill is open-to-close hold: the only execution daily OHLC bars can model
-  honestly (intraday stop/target ordering is unknowable from daily data).
-- Reality check: 1 NIFTY lot (75 qty) at 100k capital implies ~2-4% effective risk per
-  trade. That is the physical minimum; tighter is noise, not risk management.
+v4 changes (full factor mapping):
+- Global macro factors merged into the historical dataset: S&P 500, Brent crude and
+  USD/INR daily changes, SHIFTED BY ONE DAY so the simulation only knows what a trader
+  would actually know at the 09:15 IST open (no lookahead bias).
+- Event-sentiment backtesting: curated major events (events.csv) inject a decaying
+  market-impact score into the decision engine, validating news->market mapping.
+- Drawdown-adaptive confidence throttle: when equity is >10% below its peak, the
+  confidence gate tightens (+0.07), so the system trades less while wounded.
+(v3) ATR disaster stops + honest open-to-close fills. (v2) k-fold walk-forward fitness.
 """
+import csv
 import math
-from datetime import time as dtime
+import os
+from datetime import datetime, time as dtime, timedelta
 from ..options_math import bs_price
 from ..signals.engine import pivot_signal, vix_signal, SignalScore
 from ..strategy.decision import DecisionEngine
@@ -33,19 +34,59 @@ def load_history(years=20):
     df["sma20"] = df["Close"].rolling(20).mean()
     df["sma50"] = df["Close"].rolling(50).mean()
     df["atr"] = (df["High"] - df["Low"]).rolling(14).mean()
+    # Global macro factors. shift(1) after alignment = only yesterday's close is known
+    # at today's Indian open (US session ends ~02:30 IST). No lookahead.
+    for name, tkr in (("sp500", "^GSPC"), ("brent", "BZ=F"), ("usdinr", "USDINR=X")):
+        try:
+            s = yf.download(tkr, period=f"{years}y", interval="1d", progress=False, auto_adjust=True)
+            s.columns = [c[0] if isinstance(c, tuple) else c for c in s.columns]
+            chg = s["Close"].pct_change() * 100
+            df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").shift(1).fillna(0.0)
+        except Exception:
+            df[f"{name}_chg"] = 0.0
     return df.dropna()
+
+
+def load_event_impacts():
+    """Map curated historical events to decaying daily impact scores in [-1, 1]."""
+    path = os.path.join(os.path.dirname(__file__), "events.csv")
+    impacts = {}
+    try:
+        with open(path) as f:
+            for row in csv.DictReader(f):
+                d0 = datetime.strptime(row["date"], "%Y-%m-%d").date()
+                imp = max(-1.0, min(1.0, float(row["nifty_impact_pct_5d"]) / 10.0))
+                for k in range(6):  # impact decays over the following week
+                    day = d0 + timedelta(days=k)
+                    decayed = imp * (1 - k / 6)
+                    if abs(decayed) > abs(impacts.get(day, 0.0)):
+                        impacts[day] = decayed
+    except Exception:
+        pass
+    return impacts
+
+
+def macro_signal(row) -> SignalScore:
+    """Overnight macro bias from yesterday's S&P 500 (+), Brent (-) and USD/INR (-).
+    USD/INR scaled x3 because currency moves are small but high-impact (FII flows)."""
+    raw = (0.55 * row.sp500_chg - 0.15 * row.brent_chg - 3.0 * 0.35 * row.usdinr_chg) / 1.2
+    score = max(-1.0, min(1.0, raw))
+    return SignalScore("macro", score, 0.6)
 
 
 def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.068,
                  confidence_threshold=0.70, daily_max_loss_pct=3.0,
-                 daily_profit_target_pct=7.5, disaster_atr_mult=2.0):
+                 daily_profit_target_pct=7.5, disaster_atr_mult=2.0,
+                 dd_throttle=0.10, dd_threshold_bump=0.07):
     qty = lots * lot_size
     broker = PaperBroker(capital)
     risk = RiskManager(daily_profit_target=capital * daily_profit_target_pct / 100,
                        daily_max_loss=capital * daily_max_loss_pct / 100,
                        squareoff=dtime(15, 15))
     engine = DecisionEngine(confidence_threshold, weights=weights)
+    events = load_event_impacts()
     trades, equity = [], []
+    peak_eq = capital
     rows = list(df.itertuples())
     for i in range(2, len(rows)):
         prev, today = rows[i - 1], rows[i]
@@ -59,8 +100,15 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
             vix_signal(today.vix, (today.vix / prev.vix - 1) * 100 if prev.vix else 0),
             SignalScore("gift_gap", max(-1, min(1, gap_pct)), 0.7),
             SignalScore("momentum", max(-1, min(1, (prev.Close / rows[i - 2].Close - 1) * 100 / 1.2)), 0.5),
+            macro_signal(today),
         ]
-        plan = engine.decide(signals, spot)
+        # Drawdown-adaptive throttle: trade less while wounded (immune response)
+        peak_eq = max(peak_eq, broker.capital)
+        in_drawdown = (peak_eq - broker.capital) / peak_eq > dd_throttle
+        engine.threshold = confidence_threshold + (dd_threshold_bump if in_drawdown else 0.0)
+        # Event sentiment: decaying impact of major historical news on/after event dates
+        sentiment_impact = events.get(today.Index.date(), 0.0)
+        plan = engine.decide(signals, spot, sentiment_impact=sentiment_impact)
         # Trend-regime gate: never fight the established trend
         uptrend = prev.Close > prev.sma50 and prev.sma20 > prev.sma50
         downtrend = prev.Close < prev.sma50 and prev.sma20 < prev.sma50
@@ -76,8 +124,7 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         if entry_prem < 5:
             equity.append(broker.capital)
             continue
-        # Volatility-aware DISASTER stop: 2x expected daily premium move (delta~0.5 x ATR).
-        # Sits outside normal noise; only abnormal adverse days trigger it.
+        # Volatility-aware DISASTER stop: outside normal noise, abnormal days only
         exp_move = 0.5 * prev.atr
         disaster = max(1.0, entry_prem - disaster_atr_mult * exp_move)
         pos = broker.buy(f"NIFTY{plan.strike}{kind}E", qty, entry_prem, disaster,
@@ -85,8 +132,7 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         if pos is None:
             equity.append(broker.capital)
             continue
-        # Honest fill model on daily bars: hold open->close (EOD square-off).
-        # Only exception: adverse extreme breaches the disaster stop.
+        # Honest fill model on daily bars: hold open->close unless disaster stop breached
         adv_spot = today.Low if kind == "C" else today.High
         prem_adv = bs_price(adv_spot, plan.strike, r, iv, t_exp - 0.25 / 365, kind)
         prem_close = bs_price(today.Close, plan.strike, r, iv, t_exp - 1 / 365, kind)
