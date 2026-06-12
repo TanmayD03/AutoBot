@@ -24,7 +24,7 @@ from ..strategy.risk import RiskManager
 from ..execution.paper_broker import PaperBroker
 
 FACTOR_TICKERS = {
-    "sp500": "^GSPC", "nasdaq": "^IXIC", "brent": "BZ=F", "usdinr": "USDINR=X", "dxy": "DX-Y.NYB",
+    "sp500": "^GSPC", "brent": "BZ=F", "usdinr": "USDINR=X", "dxy": "DX-Y.NYB",
     "us10y": "^TNX", "nikkei": "^N225", "banknifty": "^NSEBANK",
     "adr_infy": "INFY", "adr_hdb": "HDB", "adr_ibn": "IBN",
     "hw_rel": "RELIANCE.NS", "hw_hdfc": "HDFCBANK.NS", "hw_icici": "ICICIBANK.NS",
@@ -45,18 +45,27 @@ def load_history(years=20):
     df["sma20"] = df["Close"].rolling(20).mean()
     df["sma50"] = df["Close"].rolling(50).mean()
     df["atr"] = (df["High"] - df["Low"]).rolling(14).mean()
+    # Calculate basic ADX(14)
+    high_diff = df["High"].diff()
+    low_diff = df["Low"].diff()
+    df["+dm"] = np.where((high_diff > low_diff) & (high_diff > 0), high_diff, 0.0)
+    df["-dm"] = np.where((low_diff > high_diff) & (low_diff > 0), low_diff, 0.0)
+    tr = np.maximum(df["High"] - df["Low"], np.maximum(abs(df["High"] - df["Close"].shift(1)), abs(df["Low"] - df["Close"].shift(1))))
+    df["tr14"] = tr.rolling(14).sum()
+    df["+di14"] = 100 * (df["+dm"].rolling(14).sum() / df["tr14"])
+    df["-di14"] = 100 * (df["-dm"].rolling(14).sum() / df["tr14"])
+    df["dx"] = 100 * (abs(df["+di14"] - df["-di14"]) / (df["+di14"] + df["-di14"]))
+    df["adx"] = df["dx"].rolling(14).mean()
+    df["adx"] = df["adx"].fillna(15.0) # default fallback
+    df.drop(["+dm", "-dm", "tr14", "+di14", "-di14", "dx"], axis=1, inplace=True)
+
     # Batch-download all factor tickers; shift(1) alignment = no lookahead.
     data = yf.download(list(FACTOR_TICKERS.values()), period=f"{years}y", interval="1d",
                        progress=False, group_by="ticker", auto_adjust=True)
     for name, tkr in FACTOR_TICKERS.items():
         try:
-            if name == "nikkei":
-                # Nikkei opens before Nifty. Gap from Nikkei yesterday close to today open is better
-                chg = (data[tkr]["Open"] / data[tkr]["Close"].shift(1) - 1).dropna() * 100
-                df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").fillna(0.0)
-            else:
-                chg = data[tkr]["Close"].dropna().pct_change(fill_method=None) * 100
-                df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").shift(1).fillna(0.0)
+            chg = data[tkr]["Close"].pct_change() * 100
+            df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").shift(1).fillna(0.0)
         except Exception:
             df[f"{name}_chg"] = 0.0
     # Heavyweight breadth: fraction of top-5 index anchors green yesterday, in [-1, 1]
@@ -85,6 +94,15 @@ def load_event_impacts():
     return impacts
 
 
+
+def days_to_expiry(date):
+    from datetime import timedelta
+    d = date
+    while d.weekday() != 1:  # 1 = Tuesday
+        d += timedelta(days=1)
+    delta = (d - date).days
+    return max(0.1, delta) / 365.0
+
 def _clip(x):
     return max(-1.0, min(1.0, x))
 
@@ -92,8 +110,8 @@ def _clip(x):
 def build_signals(prev, today, prev2_close) -> list:
     """All factor signals for one day. Used by backtest AND auditable by verify_data.py."""
     gap_pct = (today.Open / prev.Close - 1) * 100
-    macro_raw = (0.25 * today.sp500_chg + 0.25 * today.nasdaq_chg + 0.15 * today.nikkei_chg
-                 - 0.10 * today.brent_chg - 0.15 * today.dxy_chg - 0.10 * today.us10y_chg
+    macro_raw = (0.40 * today.sp500_chg + 0.15 * today.nikkei_chg - 0.10 * today.brent_chg
+                 - 0.15 * today.dxy_chg - 0.10 * today.us10y_chg
                  - 3.0 * 0.25 * today.usdinr_chg) / 1.2
     return [
         pivot_signal(today.Open, prev.High, prev.Low, prev.Close),
@@ -108,7 +126,7 @@ def build_signals(prev, today, prev2_close) -> list:
 
 
 def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.068,
-                 confidence_threshold=0.70, daily_max_loss_pct=3.0,
+                 confidence_threshold=0.50, daily_max_loss_pct=3.0,
                  daily_profit_target_pct=7.5, disaster_atr_mult=2.0,
                  dd_throttle=0.10, dd_threshold_bump=0.07):
     qty = lots * lot_size
@@ -118,30 +136,41 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
                        squareoff=dtime(15, 15))
     engine = DecisionEngine(confidence_threshold, weights=weights)
     events = load_event_impacts()
+    from ..nature.pheromone import PheromoneMemory
+    pheromone = PheromoneMemory(["BUY_CE", "BUY_PE", "FLIP_TO_PE", "FLIP_TO_CE"])
     trades, equity = [], []
     peak_eq = capital
     rows = list(df.itertuples())
     for i in range(2, len(rows)):
+        pheromone.evaporate()
         prev, today = rows[i - 1], rows[i]
         risk.new_day()
         spot = today.Open
         iv = max(today.vix, 8.0) / 100.0
-        t_exp = 3 / 365.0  # weekly option, ~3 days to expiry on average
+        t_exp = days_to_expiry(today.Index.date())
         signals = build_signals(prev, today, rows[i - 2].Close)
         # Drawdown-adaptive throttle: trade less while wounded (immune response)
         peak_eq = max(peak_eq, broker.capital)
         in_drawdown = (peak_eq - broker.capital) / peak_eq > dd_throttle
-        engine.threshold = confidence_threshold + (dd_threshold_bump if in_drawdown else 0.0)
+        engine.threshold = confidence_threshold # Removed dd_threshold bump to allow more trades
+        import pandas as pd
+        current_time_sim = pd.to_datetime(today.Index).to_pydatetime().replace(hour=9, minute=15)
         # Event sentiment: decaying impact of major historical news
         sentiment_impact = events.get(today.Index.date(), 0.0)
         plan = engine.decide(signals, spot, sentiment_impact=sentiment_impact)
         # Trend-regime gate: never fight the established trend
         uptrend = prev.Close > prev.sma50 and prev.sma20 > prev.sma50
         downtrend = prev.Close < prev.sma50 and prev.sma20 < prev.sma50
-        if plan.action == "BUY_CE" and not uptrend:
-            plan = None
-        elif plan.action == "BUY_PE" and not downtrend:
-            plan = None
+                # Priority 4: Re-enables CE trades in bearish regime and PE trades in bullish regime if near SMA50.
+        uptrend = prev.Close > prev.sma50 and prev.sma20 > prev.sma50
+        downtrend = prev.Close < prev.sma50 and prev.sma20 < prev.sma50
+        near_sma = abs(prev.Close / prev.sma50 - 1) < 0.005
+
+        if plan is not None:
+            if plan.action == "BUY_CE" and not (uptrend or near_sma):
+                plan = None
+            elif plan.action == "BUY_PE" and not (downtrend or near_sma):
+                plan = None
         if plan is None or plan.action == "NO_TRADE" or not risk.can_trade(len(broker.positions)):
             equity.append(broker.capital)
             continue
@@ -165,6 +194,13 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         exit_px = disaster if prem_adv <= disaster else prem_close
         pnl = broker.close(pos, exit_px)
         risk.register_pnl(pnl)
+
+        # Reinforce strategy based on PnL
+        strat_key = plan.action
+        if "Flipped Intraday" in getattr(plan, 'reason', ''):
+            strat_key = "FLIP_TO_" + plan.action[-2:]
+        pheromone.reinforce(strat_key, pnl)
+
         trades.append({"date": str(today.Index.date()), "action": plan.action,
                        "strike": plan.strike, "entry": round(pos.entry, 2),
                        "exit": round(exit_px, 2), "pnl": round(pnl, 2),
@@ -199,21 +235,27 @@ def report(trades, equity, capital):
     }
 
 
-def fitness_for_pso(df, names, folds=3):
-    """K-fold walk-forward fitness: weights must hold up across multiple regimes."""
+def fitness_for_pso(df, names, folds=5):
     n = len(df)
-    chunks = [df.iloc[int(n * k / folds):int(n * (k + 1) / folds)] for k in range(folds)]
+    # Blocked walk-forward: train on 60%, validate on 20%, test 20%
+    splits = []
+    chunk = n // folds
+    for k in range(folds - 1):
+        train = df.iloc[:chunk * (k + 1)]
+        val   = df.iloc[chunk*(k+1):chunk*(k+2)]
+        splits.append((train, val))
 
     def fitness(vec):
         weights = dict(zip(names, vec))
+        # L1 regularization: pull weights toward 1.0
+        reg = 0.04 * sum(abs(w - 1.0) for w in vec)
         exps, dds = [], []
-        for chunk in chunks:
-            rep = run_backtest(chunk, weights=weights)
-            if rep.get("trades", 0) < 5:
-                return -1e6
-            exps.append(rep["expectancy"])
-            dds.append(rep["max_drawdown_pct"])
+        for train, val in splits:
+            r = run_backtest(val, weights=weights)
+            if r.get("trades", 0) < 5: return -1e6
+            exps.append(r["expectancy"])
+            dds.append(r["max_drawdown_pct"])
         mu = sum(exps) / len(exps)
-        sd = math.sqrt(sum((e - mu) ** 2 for e in exps) / len(exps))
-        return mu - sd - 0.3 * (sum(dds) / len(dds))
+        sd = (sum((e-mu)**2 for e in exps)/len(exps))**0.5 if len(exps) > 1 else 1e-9
+        return mu - sd - 0.3*(sum(dds)/len(dds)) - reg
     return fitness

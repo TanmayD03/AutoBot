@@ -29,8 +29,8 @@ def main():
     print(f"Train {len(train)} days | Test {len(test)} days")
 
     print("Evolving signal weights with PSO (3-fold walk-forward fitness)...")
-    pso = PSO(dim=len(SIGNAL_NAMES), n_particles=12)
-    best, fit = pso.optimize(fitness_for_pso(train, SIGNAL_NAMES, folds=3), iterations=12)
+    pso = PSO(dim=len(SIGNAL_NAMES), n_particles=40)
+    best, fit = pso.optimize(fitness_for_pso(train, SIGNAL_NAMES, folds=5), iterations=50)
     weights = dict(zip(SIGNAL_NAMES, best))
     print(f"Best weights: { {k: round(v, 2) for k, v in weights.items()} } (fitness {fit:.2f})")
 
