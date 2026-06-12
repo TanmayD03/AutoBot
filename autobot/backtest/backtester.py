@@ -248,7 +248,7 @@ def fitness_for_pso(df, names, folds=5):
     def fitness(vec):
         weights = dict(zip(names, vec))
         # L1 regularization: pull weights toward 1.0
-        reg = 0.04 * sum(abs(w - 1.0) for w in vec)
+        reg = 0.05 * sum(abs(w - 1.0) for w in vec)
         exps, dds = [], []
         for train, val in splits:
             r = run_backtest(val, weights=weights)
