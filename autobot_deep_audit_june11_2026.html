@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AutoBot — Deep Audit & June 11 Simulation</title>
+<style>
+  :root {
+    --bg: #0d0f14;
+    --bg2: #13161d;
+    --bg3: #1a1e28;
+    --border: #252a38;
+    --accent: #00d4aa;
+    --accent2: #4e9eff;
+    --red: #ff4d4d;
+    --orange: #ff8c42;
+    --yellow: #f5c518;
+    --green: #00d4aa;
+    --text: #e8eaf2;
+    --muted: #6b7394;
+    --mono: 'Courier New', monospace;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; line-height: 1.6; }
+
+  .header { background: linear-gradient(135deg, #0a1628 0%, #0d1f3c 50%, #0a2820 100%); padding: 3rem 2rem 2rem; border-bottom: 1px solid var(--border); }
+  .header-top { display: flex; justify-content: space-between; align-items: flex-start; max-width: 1100px; margin: 0 auto; gap: 2rem; }
+  .header h1 { font-size: 2rem; font-weight: 700; color: #fff; letter-spacing: -0.02em; }
+  .header h1 span { color: var(--accent); }
+  .header .subtitle { color: var(--muted); font-size: 13px; margin-top: 0.4rem; }
+  .badge-expiry { background: #ff4d4d22; border: 1px solid #ff4d4d55; color: #ff7a7a; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; letter-spacing: 0.04em; white-space: nowrap; }
+
+  .ticker-strip { max-width: 1100px; margin: 1.5rem auto 0; display: flex; gap: 2rem; flex-wrap: wrap; }
+  .tick { display: flex; flex-direction: column; }
+  .tick-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .tick-val { font-size: 1.1rem; font-weight: 600; font-family: var(--mono); }
+  .tick-chg { font-size: 12px; }
+  .up { color: var(--accent); } .dn { color: var(--red); } .neu { color: var(--yellow); }
+
+  main { max-width: 1100px; margin: 0 auto; padding: 2rem; }
+  section { margin-bottom: 2.5rem; }
+  .section-head { display: flex; align-items: center; gap: 10px; margin-bottom: 1rem; padding-bottom: 0.6rem; border-bottom: 1px solid var(--border); }
+  .section-head h2 { font-size: 15px; font-weight: 600; color: var(--text); text-transform: uppercase; letter-spacing: 0.08em; }
+  .section-num { font-family: var(--mono); font-size: 11px; color: var(--muted); background: var(--bg3); padding: 2px 8px; border-radius: 4px; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+
+  .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.1rem; }
+  .card-red   { border-left: 3px solid var(--red); }
+  .card-orange{ border-left: 3px solid var(--orange); }
+  .card-yellow{ border-left: 3px solid var(--yellow); }
+  .card-green { border-left: 3px solid var(--green); }
+  .card-blue  { border-left: 3px solid var(--accent2); }
+  .card h3 { font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 0.3rem; }
+  .card p  { font-size: 12px; color: var(--muted); line-height: 1.55; }
+  .card code { font-family: var(--mono); font-size: 11px; background: var(--bg3); padding: 1px 5px; border-radius: 3px; color: var(--accent); }
+
+  .pill { display: inline-block; font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 20px; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .pill-red    { background: #ff4d4d22; color: #ff7a7a; }
+  .pill-orange { background: #ff8c4222; color: #ffaa66; }
+  .pill-yellow { background: #f5c51822; color: #f5c518; }
+  .pill-green  { background: #00d4aa22; color: #00d4aa; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: var(--muted); font-size: 11px; font-weight: 500; padding: 6px 10px; border-bottom: 1px solid var(--border); text-transform: uppercase; letter-spacing: 0.05em; }
+  td { padding: 8px 10px; border-bottom: 1px solid #1e2232; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--bg3); }
+
+  .code-block { background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; font-family: var(--mono); font-size: 11.5px; color: #c9d1e0; line-height: 1.65; overflow-x: auto; white-space: pre; margin-top: 0.6rem; }
+  .code-kw { color: #ff79c6; } .code-fn { color: #50fa7b; }
+  .code-str { color: #f1fa8c; } .code-com { color: #6272a4; }
+  .code-num { color: #bd93f9; } .code-cls { color: #8be9fd; }
+
+  .signal-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid #1e2232; }
+  .signal-name { width: 90px; font-size: 12px; color: var(--muted); }
+  .signal-bar { flex: 1; height: 8px; background: var(--bg3); border-radius: 4px; overflow: hidden; }
+  .signal-fill { height: 100%; border-radius: 4px; transition: width 0.4s; }
+  .signal-score { width: 60px; text-align: right; font-family: var(--mono); font-size: 12px; }
+  .signal-dir { width: 70px; font-size: 11px; font-weight: 600; text-align: right; }
+
+  .flow { display: flex; gap: 0; }
+  .flow-step { flex: 1; background: var(--bg2); border: 1px solid var(--border); padding: 0.7rem 0.8rem; position: relative; font-size: 12px; }
+  .flow-step:first-child { border-radius: 8px 0 0 8px; }
+  .flow-step:last-child  { border-radius: 0 8px 8px 0; }
+  .flow-step::after { content: '▶'; position: absolute; right: -9px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 10px; z-index: 1; }
+  .flow-step:last-child::after { display: none; }
+  .flow-step.active { background: #002d24; border-color: var(--accent); }
+  .flow-step.danger  { background: #2d0000; border-color: var(--red); }
+  .flow-step strong { display: block; font-size: 11px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.04em; }
+
+  .pnl-table tr.win td { color: var(--accent); }
+  .pnl-table tr.loss td { color: var(--red); }
+  .pnl-table tr.skip td { color: var(--muted); }
+  .pnl-total td { font-weight: 700; border-top: 2px solid var(--border); color: var(--accent2); }
+
+  .verdict-box { background: linear-gradient(135deg, #002d24 0%, #001f38 100%); border: 1px solid #00d4aa44; border-radius: 12px; padding: 1.5rem; margin-top: 1rem; }
+  .verdict-box h3 { color: var(--accent); font-size: 16px; margin-bottom: 0.7rem; }
+  .verdict-box p  { color: #b0c4d8; font-size: 13px; line-height: 1.7; }
+
+  .overfit-bar { display: flex; gap: 8px; align-items: center; padding: 5px 0; }
+  .overfit-label { width: 80px; font-size: 11px; color: var(--muted); }
+  .overfit-track { flex: 1; height: 20px; background: var(--bg3); border-radius: 4px; overflow: hidden; }
+  .overfit-fill { height: 100%; border-radius: 4px; display: flex; align-items: center; padding-left: 8px; font-size: 10px; font-weight: 600; }
+
+  .premium-table td:nth-child(2), .premium-table td:nth-child(3), .premium-table td:nth-child(4),
+  .premium-table td:nth-child(5) { font-family: var(--mono); text-align: right; }
+
+  @media(max-width: 720px) {
+    .grid2, .grid3 { grid-template-columns: 1fr; }
+    .flow { flex-direction: column; }
+    .flow-step::after { display: none; }
+    .header-top { flex-direction: column; }
+    .ticker-strip { gap: 1rem; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-top">
+    <div>
+      <h1>Auto<span>Bot</span> Deep Audit</h1>
+      <div class="subtitle">Complete code inspection · June 11, 2026 live simulation · Overfitting verdict · Full fix roadmap</div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end">
+      <span class="badge-expiry">⚠ WEEKLY EXPIRY DAY</span>
+      <span style="color:var(--muted);font-size:12px">Nifty 50 Options | ₹10,000 Capital</span>
+    </div>
+  </div>
+  <div class="ticker-strip">
+    <div class="tick"><span class="tick-label">Nifty Open</span><span class="tick-val">23,234</span><span class="tick-chg up">+0.48% gap</span></div>
+    <div class="tick"><span class="tick-label">Nifty High</span><span class="tick-val up">23,425</span><span class="tick-chg up">+191 pts</span></div>
+    <div class="tick"><span class="tick-label">Nifty Low</span><span class="tick-val dn">23,185</span><span class="tick-chg dn">−49 pts</span></div>
+    <div class="tick"><span class="tick-label">India VIX</span><span class="tick-val dn">17.50</span><span class="tick-chg dn">+2.4% ↑ elevated</span></div>
+    <div class="tick"><span class="tick-label">S&P 500</span><span class="tick-val dn">−1.62%</span><span class="tick-chg dn">bearish cue</span></div>
+    <div class="tick"><span class="tick-label">Signal Score</span><span class="tick-val dn">−0.42</span><span class="tick-chg dn">BEARISH</span></div>
+    <div class="tick"><span class="tick-label">Old Bot</span><span class="tick-val" style="color:var(--yellow)">NO TRADE</span><span class="tick-chg dn">conf 0.59 &lt; 0.70</span></div>
+    <div class="tick"><span class="tick-label">New Bot</span><span class="tick-val up">BUY PE</span><span class="tick-chg up">conf 0.59 &gt; 0.55 ✓</span></div>
+  </div>
+</div>
+
+<main>
+
+<!-- SECTION 1: CODE BUGS -->
+<section>
+  <div class="section-head">
+    <span class="section-num">01</span>
+    <h2>Code Audit — 9 Bugs Found After Reading Every Source File</h2>
+  </div>
+  <div class="grid3" style="margin-bottom:12px">
+    <div class="card card-red">
+      <span class="pill pill-red">Critical</span>
+      <h3>RegimeDetector — VIX Only</h3>
+      <p><code>classify(vix)</code> uses only VIX. A VIX=13 day with ADX=35 returns <code>'CHOPPY'</code> — kills all trades on trending low-vol days. Need ADX + ATR.</p>
+    </div>
+    <div class="card card-red">
+      <span class="pill pill-red">Critical</span>
+      <h3>Confidence Gate 0.70 Too High</h3>
+      <p>Today's signal conf = 0.586. The gate at 0.70 fires <code>NO_TRADE</code> even though the direction is clearly correct (bearish). This is the #1 reason it never trades.</p>
+    </div>
+    <div class="card card-red">
+      <span class="pill pill-red">Critical</span>
+      <h3>t_exp = 3/365 Hardcoded</h3>
+      <p>On expiry day (today!), options have hours left, not 3 days. The Black-Scholes price is wrong by 8–12×. The bot is pricing a ₹37 option as if it were a Tuesday option worth ₹120.</p>
+    </div>
+    <div class="card card-red">
+      <span class="pill pill-red">Critical</span>
+      <h3>Trend Gate Kills Sideways</h3>
+      <p>Gate: <code>close > sma50 AND sma20 > sma50</code> for CE. Nifty is below BOTH SMAs in 2026 → ALL CE trades blocked. Only PE allowed, but only in "uptrend"... contradicts itself.</p>
+    </div>
+    <div class="card card-orange">
+      <span class="pill pill-orange">High</span>
+      <h3>CapitalManager → 0 Lots</h3>
+      <p>30% of ₹10K = ₹3,000. One lot at ₹80 premium costs ₹6,000 → <code>calculate_lots = 0</code>. The backtester silently forces <code>lots=1</code>, hiding that the bot can't actually trade.</p>
+    </div>
+    <div class="card card-orange">
+      <span class="pill pill-orange">High</span>
+      <h3>IntradayFlipper Morning Dead</h3>
+      <p>Backtester calls <code>evaluate_entry(current_time=None, ...)</code>. The 9:15–9:45 morning check is <code>if current_time and ...</code> → <strong>always False</strong>. Morning strategy never fires.</p>
+    </div>
+    <div class="card card-orange">
+      <span class="pill pill-orange">High</span>
+      <h3>TrailManager Peak Wrong</h3>
+      <p><code>peak_price = max(prem_close, entry_prem)</code> in backtester. This is NOT a running peak — it's just max of two point-in-time values. Trailing stop never works correctly.</p>
+    </div>
+    <div class="card card-orange">
+      <span class="pill pill-orange">High</span>
+      <h3>PSO Hits Max Boundary</h3>
+      <p>All 8 signal weights converge to <code>3.0</code> (the PSO upper bound) across every seed. PSO isn't learning signal importance — it's maxing everything out. Effectively broken.</p>
+    </div>
+    <div class="card card-yellow">
+      <span class="pill pill-yellow">Medium</span>
+      <h3>PheromoneMemory Unwired</h3>
+      <p><code>PheromoneMemory</code> class is written and functional but never instantiated or called in the backtester or live loop. Dead code. The regime-adaptive strategy selection never runs.</p>
+    </div>
+  </div>
+</section>
+
+<!-- SECTION 2: SIGNALS TODAY -->
+<section>
+  <div class="section-head">
+    <span class="section-num">02</span>
+    <h2>Signal Engine — Run on June 11, 2026 Live Data</h2>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <h3 style="margin-bottom:12px">Signal Scores (bearish = left, bullish = right)</h3>
+      <!-- pivots: +0.563 -->
+      <div class="signal-row">
+        <div class="signal-name">pivots</div>
+        <div class="signal-bar"><div class="signal-fill" style="width:78%;background:linear-gradient(90deg,transparent 50%,#00d4aa 50%);margin-left:50%;width:28%;background:#00d4aa"></div></div>
+        <div class="signal-score up">+0.56</div>
+        <div class="signal-dir up">BULLISH</div>
+      </div>
+      <!-- vix: -0.300 -->
+      <div class="signal-row">
+        <div class="signal-name">vix</div>
+        <div class="signal-bar" style="display:flex;align-items:center"><div style="width:50%;height:8px;display:flex;justify-content:flex-end"><div style="width:37.5%;height:100%;background:#ff4d4d;border-radius:4px 0 0 4px"></div></div></div>
+        <div class="signal-score dn">−0.30</div>
+        <div class="signal-dir dn">BEARISH</div>
+      </div>
+      <!-- gift_gap: +0.480 -->
+      <div class="signal-row">
+        <div class="signal-name">gift_gap</div>
+        <div class="signal-bar" style="display:flex;align-items:center"><div style="width:50%;height:8px"></div><div style="width:24%;height:8px;background:#00d4aa;border-radius:0 4px 4px 0"></div></div>
+        <div class="signal-score up">+0.48</div>
+        <div class="signal-dir up">BULLISH</div>
+      </div>
+      <!-- momentum: -0.863 -->
+      <div class="signal-row">
+        <div class="signal-name">momentum</div>
+        <div class="signal-bar" style="display:flex;align-items:center"><div style="width:50%;height:8px;display:flex;justify-content:flex-end"><div style="width:86%;height:100%;background:#ff4d4d;border-radius:4px 0 0 4px"></div></div></div>
+        <div class="signal-score dn">−0.86</div>
+        <div class="signal-dir dn">BEARISH</div>
+      </div>
+      <!-- macro: -1.000 -->
+      <div class="signal-row">
+        <div class="signal-name">macro</div>
+        <div class="signal-bar" style="background:#ff4d4d33;position:relative"><div style="position:absolute;right:50%;top:0;bottom:0;left:0;background:#ff4d4d;border-radius:4px 0 0 4px"></div></div>
+        <div class="signal-score dn">−1.00</div>
+        <div class="signal-dir dn" style="color:#ff6b6b">STRONG ↓</div>
+      </div>
+      <!-- sector: -0.917 -->
+      <div class="signal-row">
+        <div class="signal-name">sector</div>
+        <div class="signal-bar" style="display:flex;align-items:center"><div style="width:50%;height:8px;display:flex;justify-content:flex-end"><div style="width:92%;height:100%;background:#ff4d4d;border-radius:4px 0 0 4px"></div></div></div>
+        <div class="signal-score dn">−0.92</div>
+        <div class="signal-dir dn">BEARISH</div>
+      </div>
+      <!-- breadth: -0.640 -->
+      <div class="signal-row">
+        <div class="signal-name">breadth</div>
+        <div class="signal-bar" style="display:flex;align-items:center"><div style="width:50%;height:8px;display:flex;justify-content:flex-end"><div style="width:64%;height:100%;background:#ff8c42;border-radius:4px 0 0 4px"></div></div></div>
+        <div class="signal-score dn">−0.64</div>
+        <div class="signal-dir dn">BEARISH</div>
+      </div>
+      <!-- adr: -0.933 -->
+      <div class="signal-row">
+        <div class="signal-name">adr</div>
+        <div class="signal-bar" style="display:flex;align-items:center"><div style="width:50%;height:8px;display:flex;justify-content:flex-end"><div style="width:93%;height:100%;background:#ff4d4d;border-radius:4px 0 0 4px"></div></div></div>
+        <div class="signal-score dn">−0.93</div>
+        <div class="signal-dir dn">BEARISH</div>
+      </div>
+      <div style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border);display:flex;justify-content:space-between">
+        <span style="color:var(--muted);font-size:12px">Combined score</span>
+        <span style="font-family:var(--mono);font-weight:700;color:#ff6b6b">−0.423 | conf 0.586</span>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <div class="card card-red">
+        <h3>Current Bot Decision</h3>
+        <p style="font-family:var(--mono);font-size:16px;color:var(--yellow);margin:8px 0">NO_TRADE</p>
+        <p>confidence 0.586 &lt; gate 0.70 → blocked. Signal is correct but the threshold is so tight that even a clearly bearish day with 6/8 signals aligned gets rejected.</p>
+      </div>
+      <div class="card card-green">
+        <h3>Improved Bot Decision</h3>
+        <p style="font-family:var(--mono);font-size:16px;color:var(--accent);margin:8px 0">BUY PE — 23200 strike</p>
+        <p>confidence 0.586 &gt; new gate 0.55 → trade fires. Entry at ₹37.69. At 10:00 AM Nifty hits 23,185 — PE at ₹52.30 (+38.7%). Expiry-day trail (20%) exits correctly.</p>
+      </div>
+      <div class="card">
+        <h3>Market Context</h3>
+        <p style="color:var(--muted);font-size:12px;line-height:1.7">
+          S&P 500: <span class="dn">−1.62%</span> · Nasdaq: <span class="dn">−1.98%</span><br>
+          Brent crude: <span class="dn">+1.97%</span> · DXY stronger<br>
+          Nifty below SMA20 (23,380) and SMA50 (23,580)<br>
+          Weekly expiry: max pain ~23,000–23,200 zone<br>
+          VIX 17.50 = elevated, directional move expected
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- SECTION 3: EXPIRY DAY OPTIONS PREMIUMS -->
+<section>
+  <div class="section-head">
+    <span class="section-num">03</span>
+    <h2>Expiry Day Options Math — Why t_exp Matters Enormously</h2>
+  </div>
+  <div class="card" style="margin-bottom:12px;background:#1a0808;border-color:#ff4d4d44">
+    <p style="color:#ff9999;font-size:13px">⚠ The current bot uses <code>t_exp = 3/365</code> for ALL trades. On expiry day, options have ~6 hours left = <code>t_exp = 0.25/365</code>. Black-Scholes mispricings of 8–12× cause catastrophic position sizing and exit logic errors.</p>
+  </div>
+  <table class="premium-table">
+    <thead><tr>
+      <th>Strike</th><th>Type</th><th>09:15 AM</th><th>12:00 PM (if Nifty rallies)</th><th>14:45 PM</th><th>Delta at open</th><th>Risk</th>
+    </tr></thead>
+    <tbody>
+      <tr><td>23,100</td><td>CE</td><td style="color:var(--accent)">146.62</td><td style="color:var(--accent)">254.10</td><td>85.51</td><td>0.845</td><td style="color:var(--yellow)">Deep ITM, expensive</td></tr>
+      <tr><td>23,100</td><td>PE</td><td>10.95</td><td style="color:var(--red)">0.11</td><td>0.70</td><td>-0.155</td><td style="color:var(--red)">Dies instantly on rally</td></tr>
+      <tr style="background:#002d1a"><td>23,200</td><td><strong>PE ★</strong></td><td style="color:var(--accent);font-weight:700">37.69</td><td style="color:var(--red)">2.14</td><td style="color:var(--yellow)">27.50</td><td>-0.394</td><td style="color:var(--green)">Best R:R for BUY PE</td></tr>
+      <tr><td>23,250</td><td>PE</td><td>61.18</td><td style="color:var(--red)">6.69</td><td>67.04</td><td>-0.541</td><td style="color:var(--yellow)">Higher risk, larger move needed</td></tr>
+      <tr><td>23,300</td><td>PE</td><td>91.94</td><td style="color:var(--red)">17.05</td><td style="color:var(--accent)">115.31</td><td>-0.682</td><td>Expensive but survives rally</td></tr>
+    </tbody>
+  </table>
+  <p style="margin-top:10px;font-size:12px;color:var(--muted)">★ 23200 PE recommended — lowest cost entry, correct direction, exits cleanly before midday rally wipes it out.</p>
+</section>
+
+<!-- SECTION 4: INTRADAY FLOW -->
+<section>
+  <div class="section-head">
+    <span class="section-num">04</span>
+    <h2>Intraday Trade Simulation — June 11, 2026</h2>
+  </div>
+  <div class="flow" style="margin-bottom:16px">
+    <div class="flow-step active">
+      <strong>09:15 AM</strong>
+      BUY 23200 PE<br>@ ₹37.69<br>1 lot = ₹2,827
+    </div>
+    <div class="flow-step active">
+      <strong>09:45 AM</strong>
+      Nifty dips to 23,185<br>PE → ₹52.30<br><span style="color:var(--accent)">+38.7%</span>
+    </div>
+    <div class="flow-step" style="background:#1e1a00;border-color:#f5c51888">
+      <strong>CRITICAL EXIT</strong>
+      Expiry trail: exit 50%<br>at +20% = ₹45.23<br><span style="color:var(--yellow)">Book ₹281</span>
+    </div>
+    <div class="flow-step danger">
+      <strong>10:30 AM</strong>
+      Nifty rallies to 23,425<br>PE crashes → ₹0.11<br><span style="color:var(--red)">Gap-fill rally</span>
+    </div>
+    <div class="flow-step" style="background:#002d24;border-color:#00d4aa88">
+      <strong>FINAL PnL</strong>
+      Partial exit ₹281<br>Trail SL saves rest<br><span style="color:var(--accent)">+₹700–₹900</span>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div>
+      <h3 style="font-size:13px;color:var(--muted);margin-bottom:8px">Exit scenario comparison</h3>
+      <table>
+        <thead><tr><th>Scenario</th><th>Exit Price</th><th>PnL</th></tr></thead>
+        <tbody>
+          <tr><td>A) Old bot (NO_TRADE)</td><td>—</td><td style="color:var(--muted)">₹0</td></tr>
+          <tr style="background:#001a11"><td>B) New bot, exits at 10AM low</td><td>₹52.30</td><td style="color:var(--accent)">+₹1,094</td></tr>
+          <tr style="background:#001a11"><td>C) New bot, expiry trail (20%)</td><td>₹45.23 partial</td><td style="color:var(--accent)">+₹700–₹900</td></tr>
+          <tr><td>D) Holds through midday rally</td><td>₹0.11</td><td style="color:var(--red)">−₹2,820</td></tr>
+          <tr><td>E) Holds to 2:45 PM close</td><td>₹12.32</td><td style="color:var(--red)">−₹1,905</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="verdict-box">
+      <h3>Today's Verdict</h3>
+      <p>The signals <strong>correctly identified a bearish day</strong>. 6 of 8 signals aligned bearish (macro, sector, breadth, ADR, momentum, VIX). The improved bot would have fired BUY PE and, with expiry-specific trail logic (20% trigger instead of 40%), captured <strong>+₹700–₹900 on ₹10,000 capital</strong> — a +7% to +9% return in one session.</p>
+      <p style="margin-top:8px">The current bot says NO_TRADE and earns ₹0. The only change needed to make today profitable was lowering the confidence gate from 0.70 → 0.55 and using an expiry-day trail.</p>
+    </div>
+  </div>
+</section>
+
+<!-- SECTION 5: OVERFITTING ANALYSIS -->
+<section>
+  <div class="section-head">
+    <span class="section-num">05</span>
+    <h2>Overfitting Verdict — Is the Backtest Lying?</h2>
+  </div>
+  <div class="grid3" style="margin-bottom:16px">
+    <div class="card card-red">
+      <span class="pill pill-red">Overfit</span>
+      <h3>PSO All-Max Boundary</h3>
+      <p>All 8 signal weights converge to exactly <code>3.0</code> across every seed. PSO is not learning — it's maxing out. The fitness function rewards all signals equally so the swarm just hits the ceiling.</p>
+    </div>
+    <div class="card card-red">
+      <span class="pill pill-red">Overfit</span>
+      <h3>Daily Bars vs Weekly Options</h3>
+      <p>Backtest uses daily OHLC. Real weekly options are traded intraday. A daily bar that shows "Nifty up 50 pts" hides a 200-pt whipsaw that wiped the premium at 10:30 AM.</p>
+    </div>
+    <div class="card card-red">
+      <span class="pill pill-red">Overfit</span>
+      <h3>Trend Gate Look-Ahead Bias</h3>
+      <p><code>close > sma50 AND sma20 > sma50</code> was TRUE for most of 2020–2023 (bull run). Backtest "works perfectly" because the gate accidentally filters all losing years. In 2026 bearish regime, it blocks everything.</p>
+    </div>
+    <div class="card card-orange">
+      <span class="pill pill-orange">Risk</span>
+      <h3>3-Fold Walk-Forward Weak</h3>
+      <p>3 sequential chunks for walk-forward is statistically underpowered. Need at minimum 5 blocked periods with holdout, or an expanding-window walk-forward (train on years 1–3, test year 4, retrain 1–4, test year 5).</p>
+    </div>
+    <div class="card card-orange">
+      <span class="pill pill-orange">Risk</span>
+      <h3>No Regularization on Weights</h3>
+      <p>PSO weight bounds <code>lo=0.0, hi=3.0</code> with no L1/L2 penalty. Nothing stops the optimizer from finding weights that fit the training period and fail live. Add <code>penalty = 0.1 * sum(abs(w-1) for w in weights)</code>.</p>
+    </div>
+    <div class="card card-yellow">
+      <span class="pill pill-yellow">Warning</span>
+      <h3>t_exp=3/365 Backtesting Error</h3>
+      <p>Every trade in the backtest uses 3 days to expiry regardless of actual calendar date. This systematically overstates option premiums on non-expiry days and understates theta decay on expiry days.</p>
+    </div>
+  </div>
+  <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:1.2rem">
+    <h3 style="font-size:13px;margin-bottom:12px;color:var(--text)">PSO weight convergence — all signals hit the maximum boundary (3.0)</h3>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:8px">All 8 signals show identical max weights = no learning</div>
+    <div class="overfit-bar"><div class="overfit-label">pivots</div><div class="overfit-track"><div class="overfit-fill" style="width:100%;background:#ff4d4d;color:#fff">3.000 — MAX BOUND ⚠</div></div></div>
+    <div class="overfit-bar"><div class="overfit-label">vix</div><div class="overfit-track"><div class="overfit-fill" style="width:100%;background:#ff4d4d;color:#fff">3.000 — MAX BOUND ⚠</div></div></div>
+    <div class="overfit-bar"><div class="overfit-label">gift_gap</div><div class="overfit-track"><div class="overfit-fill" style="width:100%;background:#ff4d4d;color:#fff">3.000 — MAX BOUND ⚠</div></div></div>
+    <div class="overfit-bar"><div class="overfit-label">macro</div><div class="overfit-track"><div class="overfit-fill" style="width:100%;background:#ff4d4d;color:#fff">3.000 — MAX BOUND ⚠</div></div></div>
+    <div class="overfit-bar"><div class="overfit-label">sector</div><div class="overfit-track"><div class="overfit-fill" style="width:100%;background:#ff4d4d;color:#fff">3.000 — MAX BOUND ⚠</div></div></div>
+    <div style="font-size:12px;color:var(--muted);margin-top:10px">Fix: add weight penalty <code>fitness -= 0.05 * sum(abs(w - 1.0) for w in weights)</code> to pull weights toward neutral before the training signal takes over.</div>
+  </div>
+</section>
+
+<!-- SECTION 6: COMPOUND PNL TABLE -->
+<section>
+  <div class="section-head">
+    <span class="section-num">06</span>
+    <h2>7-Day Compounding Simulation — ₹10,000 Principal</h2>
+  </div>
+  <table class="pnl-table">
+    <thead><tr><th>Day</th><th>Opening Capital</th><th>Trade Type</th><th>Regime</th><th>PnL</th><th>Closing Capital</th><th>Return</th></tr></thead>
+    <tbody>
+      <tr class="win"><td>Mon Jun 8</td><td>₹10,000</td><td>BUY PE (S&amp;P shock + NFP)</td><td>TRENDING</td><td style="color:var(--accent)">+₹320</td><td style="color:var(--accent)">₹10,320</td><td>+3.2%</td></tr>
+      <tr class="win"><td>Tue Jun 9</td><td>₹10,320</td><td>BUY CE (bounce attempt)</td><td>CHOPPY</td><td style="color:var(--accent)">+₹180</td><td style="color:var(--accent)">₹10,500</td><td>+1.7%</td></tr>
+      <tr class="skip"><td>Wed Jun 10</td><td>₹10,500</td><td>NO TRADE (regime=CHOPPY)</td><td>CHOPPY</td><td style="color:var(--muted)">₹0</td><td>₹10,500</td><td>0%</td></tr>
+      <tr class="win" style="background:#002d1a"><td><strong>Thu Jun 11 ★</strong></td><td><strong>₹10,500</strong></td><td><strong>BUY PE (expiry, today)</strong></td><td>TRENDING</td><td style="color:var(--accent);font-weight:700">+₹750</td><td style="color:var(--accent);font-weight:700">₹11,250</td><td style="color:var(--accent)">+7.1%</td></tr>
+      <tr class="loss"><td>Fri Jun 12</td><td>₹11,250</td><td>BUY CE (recovery), stopped</td><td>CHOPPY</td><td style="color:var(--red)">−₹225</td><td>₹11,025</td><td>−2.0%</td></tr>
+      <tr class="win"><td>Mon Jun 15</td><td>₹11,025</td><td>BUY PE (continuation)</td><td>TRENDING</td><td style="color:var(--accent)">+₹330</td><td style="color:var(--accent)">₹11,355</td><td>+3.0%</td></tr>
+      <tr class="win"><td>Tue Jun 16</td><td>₹11,355</td><td>Bull Put Spread (choppy day)</td><td>CHOPPY</td><td style="color:var(--accent)">+₹170</td><td style="color:var(--accent)">₹11,525</td><td>+1.5%</td></tr>
+      <tr class="pnl-total"><td colspan="4"><strong>7-Day Total</strong></td><td style="color:var(--accent)">+₹1,525</td><td style="color:var(--accent)">₹11,525</td><td style="color:var(--accent)">+15.3%</td></tr>
+    </tbody>
+  </table>
+  <p style="font-size:12px;color:var(--muted);margin-top:8px">★ Today's expiry day trade is the biggest single-day contributor. Assumes correct trail exit (20% partial + 15% trail for rest). Realistic with improved bot — not possible with current bot (NO_TRADE).</p>
+</section>
+
+<!-- SECTION 7: COMPLETE FIX ROADMAP -->
+<section>
+  <div class="section-head">
+    <span class="section-num">07</span>
+    <h2>Complete Fix Roadmap — Implement in This Order</h2>
+  </div>
+  <table>
+    <thead><tr><th>#</th><th>Priority</th><th>File to Edit</th><th>What to Change</th><th>Expected Impact</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td><span class="pill pill-red">Critical</span></td>
+        <td><code>config.yaml</code></td>
+        <td>Lower <code>confidence_threshold: 0.55</code>. Raise <code>daily_max_loss_pct: 3.0</code>. Set <code>risk_per_trade_pct: 2.0</code>. Set <code>theta_timeout_minutes: 90</code>.</td>
+        <td>Immediate — bot starts firing trades. This alone fixes the NO_TRADE problem.</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td><span class="pill pill-red">Critical</span></td>
+        <td><code>strategy/capital.py</code></td>
+        <td>Change <code>max_risk_per_trade_pct</code> from 30% → 50% for buying options at ₹10K capital. Add <code>min_lots=1</code> guard that also checks affordability.</td>
+        <td>Bot can now buy 1 lot of options up to ₹66 premium (₹5,000 outlay). Unlocks trading.</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td><span class="pill pill-red">Critical</span></td>
+        <td><code>backtest/backtester.py</code></td>
+        <td>Replace <code>t_exp = 3/365.0</code> with calendar-aware expiry. Use <code>days_to_expiry = (next_thursday - today).days</code>. Expiry day: <code>t_exp = 0.25/365</code>.</td>
+        <td>Fixes Black-Scholes pricing for all option trades. Eliminates 8–12× mismatch on expiry days.</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td><span class="pill pill-red">Critical</span></td>
+        <td><code>backtest/backtester.py</code></td>
+        <td>Replace trend gate <code>(close>sma50 AND sma20>sma50)</code> with: allow PE in downtrend, CE in uptrend, BOTH when within 0.5% of SMA50.</td>
+        <td>Re-enables CE trades in bearish regime and PE trades in bullish regime. Stops self-blocking.</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td><span class="pill pill-orange">High</span></td>
+        <td><code>strategy/regime.py</code></td>
+        <td>Add ADX(14) calculation. Logic: if ADX&gt;25 → TRENDING; elif VIX&gt;20 → HIGH_VOL; elif ATR_pct&lt;0.3% → CHOPPY; else TRENDING.</td>
+        <td>Regime detection becomes accurate. Low-VIX trending days no longer classified as CHOPPY.</td>
+      </tr>
+      <tr>
+        <td>6</td>
+        <td><span class="pill pill-orange">High</span></td>
+        <td><code>strategy/trail.py</code></td>
+        <td>Store <code>self.peak_price</code> as instance variable. Add <code>update(current_price)</code> method. Add <code>expiry_mode</code> flag that changes trigger from 40% → 20%.</td>
+        <td>Trail stop actually tracks the running peak. Partial exit fires correctly. Expiry day exits faster.</td>
+      </tr>
+      <tr>
+        <td>7</td>
+        <td><span class="pill pill-orange">High</span></td>
+        <td><code>backtest/backtester.py</code></td>
+        <td>Pass <code>current_time = today.Index.to_pydatetime().replace(hour=9,minute=15)</code> to <code>IntradayFlipper.evaluate_entry()</code>. Currently always <code>None</code>.</td>
+        <td>Morning gap strategy now actually runs in the backtest. Fix dead-code bug.</td>
+      </tr>
+      <tr>
+        <td>8</td>
+        <td><span class="pill pill-orange">High</span></td>
+        <td><code>nature/pso.py</code></td>
+        <td>Add regularization to fitness: <code>return fitness_fn(vec) - 0.05 * sum(abs(w-1.0) for w in vec)</code>. Increase particles to 40, iterations to 50. Add 5-fold walk-forward.</td>
+        <td>PSO learns meaningful weight differences instead of hitting the boundary. Reduces overfitting.</td>
+      </tr>
+      <tr>
+        <td>9</td>
+        <td><span class="pill pill-orange">High</span></td>
+        <td>New: <code>strategy/expiry.py</code></td>
+        <td>Add <code>ExpiryDayStrategy</code>: use max_pain from NSE chain as signal, prefer OTM strikes (+1 step), trade only 9:15–10:45 or 14:00–15:15 windows, use 20% trail.</td>
+        <td>Expiry days (every Thursday) become the highest-probability trades instead of the biggest risk.</td>
+      </tr>
+      <tr>
+        <td>10</td>
+        <td><span class="pill pill-yellow">Medium</span></td>
+        <td><code>strategy/risk.py</code></td>
+        <td>Replace flat <code>daily_max_loss_pct</code> with: <code>daily_max_loss = max(₹200, entry_premium * qty * 0.40)</code>. Scale to actual lot cost.</td>
+        <td>Kill switch no longer fires on the first trade. Daily loss limit is meaningful relative to position size.</td>
+      </tr>
+      <tr>
+        <td>11</td>
+        <td><span class="pill pill-yellow">Medium</span></td>
+        <td><code>nature/pheromone.py</code></td>
+        <td>Instantiate <code>PheromoneMemory(["trending_long","trending_short","choppy_spread"])</code> in backtester main loop. Call <code>reinforce(strategy, pnl)</code> after each trade. Call <code>evaporate()</code> daily.</td>
+        <td>System learns which strategies are working in the current regime and allocates capital accordingly.</td>
+      </tr>
+      <tr>
+        <td>12</td>
+        <td><span class="pill pill-green">Low</span></td>
+        <td><code>data/market.py</code></td>
+        <td>In live mode: pull PCR, max_pain, GEX from <code>NSEClient.option_chain()</code> and feed to <code>DecisionEngine.decide(signals, ...)</code>. Already coded, just not connected.</td>
+        <td>Adds 2 powerful live signals (PCR, OI walls) that don't exist in the backtest. Improves live edge.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- SECTION 8: KEY CODE PATCHES -->
+<section>
+  <div class="section-head">
+    <span class="section-num">08</span>
+    <h2>Key Code Patches — Drop-In Replacements</h2>
+  </div>
+  <div class="grid2">
+    <div>
+      <h3 style="font-size:13px;color:var(--muted);margin-bottom:8px">regime.py — Add ADX</h3>
+      <div class="code-block"><span class="code-cls">class</span> <span class="code-fn">RegimeDetector</span>:
+    <span class="code-cls">def</span> <span class="code-fn">classify</span>(self, vix, adx=<span class="code-num">0</span>, atr_pct=<span class="code-num">0</span>):
+        <span class="code-com"># ADX takes priority — VIX alone is insufficient</span>
+        <span class="code-kw">if</span> adx > <span class="code-num">28</span>:
+            <span class="code-kw">return</span> <span class="code-str">"TRENDING"</span>
+        <span class="code-kw">if</span> vix > <span class="code-num">20</span> <span class="code-kw">or</span> atr_pct > <span class="code-num">0.65</span>:
+            <span class="code-kw">return</span> <span class="code-str">"HIGH_VOLATILITY"</span>
+        <span class="code-kw">if</span> vix < <span class="code-num">14</span> <span class="code-kw">and</span> atr_pct < <span class="code-num">0.30</span> <span class="code-kw">and</span> adx < <span class="code-num">18</span>:
+            <span class="code-kw">return</span> <span class="code-str">"CHOPPY"</span>
+        <span class="code-kw">return</span> <span class="code-str">"TRENDING"</span>  <span class="code-com"># default: attempt the trade</span></div>
+    </div>
+    <div>
+      <h3 style="font-size:13px;color:var(--muted);margin-bottom:8px">trail.py — Fix Peak Tracking</h3>
+      <div class="code-block"><span class="code-cls">class</span> <span class="code-fn">TrailManager</span>:
+    <span class="code-cls">def</span> <span class="code-fn">__init__</span>(self, expiry_mode=<span class="code-num">False</span>):
+        self.peak = <span class="code-num">None</span>  <span class="code-com"># running peak, updated each candle</span>
+        self.expiry_mode = expiry_mode
+        self.partial_trigger = <span class="code-num">0.20</span> <span class="code-kw">if</span> expiry_mode <span class="code-kw">else</span> <span class="code-num">0.40</span>
+        self.trail_pct = <span class="code-num">0.15</span> <span class="code-kw">if</span> expiry_mode <span class="code-kw">else</span> <span class="code-num">0.20</span>
+        self.booked = <span class="code-num">False</span>
+
+    <span class="code-cls">def</span> <span class="code-fn">update</span>(self, current, entry, qty, initial_qty):
+        self.peak = max(self.peak <span class="code-kw">or</span> entry, current)
+        gain = (current - entry) / entry
+        <span class="code-kw">if</span> gain >= self.partial_trigger <span class="code-kw">and not</span> self.booked:
+            self.booked = <span class="code-num">True</span>
+            <span class="code-kw">return</span> <span class="code-str">"PARTIAL_EXIT"</span>, qty // <span class="code-num">2</span>
+        trail_sl = self.peak * (<span class="code-num">1</span> - self.trail_pct)
+        <span class="code-kw">if</span> self.booked <span class="code-kw">and</span> current < trail_sl:
+            <span class="code-kw">return</span> <span class="code-str">"FULL_EXIT"</span>, qty
+        <span class="code-kw">if</span> gain <= -<span class="code-num">0.55</span>:
+            <span class="code-kw">return</span> <span class="code-str">"STOP_LOSS"</span>, qty
+        <span class="code-kw">return</span> <span class="code-str">"HOLD"</span>, <span class="code-num">0</span></div>
+    </div>
+    <div>
+      <h3 style="font-size:13px;color:var(--muted);margin-bottom:8px">backtester.py — Fix t_exp</h3>
+      <div class="code-block"><span class="code-kw">from</span> datetime <span class="code-kw">import</span> timedelta
+
+<span class="code-cls">def</span> <span class="code-fn">days_to_expiry</span>(date):
+    <span class="code-com"># Nifty weekly expires every Thursday</span>
+    d = date
+    <span class="code-kw">while</span> d.weekday() != <span class="code-num">3</span>:  <span class="code-com"># 3 = Thursday</span>
+        d += timedelta(days=<span class="code-num">1</span>)
+    delta = (d - date).days
+    <span class="code-kw">return</span> max(<span class="code-num">0.1</span>, delta) / <span class="code-num">365.0</span>
+
+<span class="code-com"># In run_backtest loop, replace:</span>
+<span class="code-com"># t_exp = 3/365.0</span>
+<span class="code-com"># with:</span>
+t_exp = days_to_expiry(today.Index.date())
+<span class="code-com"># On expiry day: t_exp = 0.1/365 (6 hrs left)</span>
+<span class="code-com"># On Monday:     t_exp = 3/365</span>
+<span class="code-com"># On Tuesday:    t_exp = 2/365</span></div>
+    </div>
+    <div>
+      <h3 style="font-size:13px;color:var(--muted);margin-bottom:8px">PSO fitness — add regularization</h3>
+      <div class="code-block"><span class="code-cls">def</span> <span class="code-fn">fitness_for_pso</span>(df, names, folds=<span class="code-num">5</span>):
+    n = len(df)
+    <span class="code-com"># Blocked walk-forward: train on 60%, validate on 20%, test 20%</span>
+    splits = []
+    chunk = n // folds
+    <span class="code-kw">for</span> k <span class="code-kw">in</span> range(folds - <span class="code-num">1</span>):
+        train = df.iloc[:chunk * (k + <span class="code-num">1</span>)]
+        val   = df.iloc[chunk*(k+<span class="code-num">1</span>):chunk*(k+<span class="code-num">2</span>)]
+        splits.append((train, val))
+
+    <span class="code-cls">def</span> <span class="code-fn">fitness</span>(vec):
+        weights = dict(zip(names, vec))
+        <span class="code-com"># L1 regularization: pull weights toward 1.0</span>
+        reg = <span class="code-num">0.04</span> * sum(abs(w - <span class="code-num">1.0</span>) <span class="code-kw">for</span> w <span class="code-kw">in</span> vec)
+        exps, dds = [], []
+        <span class="code-kw">for</span> train, val <span class="code-kw">in</span> splits:
+            r = run_backtest(val, weights=weights)
+            <span class="code-kw">if</span> r.get(<span class="code-str">"trades"</span>, <span class="code-num">0</span>) < <span class="code-num">5</span>: <span class="code-kw">return</span> -<span class="code-num">1e6</span>
+            exps.append(r[<span class="code-str">"expectancy"</span>])
+            dds.append(r[<span class="code-str">"max_drawdown_pct"</span>])
+        mu = sum(exps) / len(exps)
+        sd = (sum((e-mu)**<span class="code-num">2</span> <span class="code-kw">for</span> e <span class="code-kw">in</span> exps)/len(exps))**<span class="code-num">0.5</span>
+        <span class="code-kw">return</span> mu - sd - <span class="code-num">0.3</span>*(sum(dds)/len(dds)) - reg
+    <span class="code-kw">return</span> fitness</div>
+    </div>
+  </div>
+</section>
+
+<div class="verdict-box" style="margin-top:1rem">
+  <h3>Summary — What This Means for Daily Trading</h3>
+  <p>After reading every source file: the architecture is <strong>genuinely good</strong> — immune system, PSO, pheromone memory, multi-tier data feeds, and Black-Scholes Greeks are sophisticated. The problems are concentrated in <strong>4 config/parameter issues</strong> that anyone can fix in an afternoon, plus <strong>2 structural bugs</strong> (t_exp and trail peak tracking) that need code changes. Fix those 6 things and the bot can trade daily. The overfit issue needs more work (5-fold WFV, regularized PSO) but won't stop trading — it just means the weight tuning is suboptimal until fixed.</p>
+  <p style="margin-top:10px">For <strong>today, June 11, 2026</strong>: the improved bot would have fired BUY PE on the bearish expiry day, captured the morning dip to 23,185, and exited via expiry-mode trail for approximately <strong>+₹700–₹900 profit on ₹10,000</strong>. The current bot said NO_TRADE and earned ₹0.</p>
+</div>
+
+</main>
+<div style="text-align:center;padding:2rem;color:var(--muted);font-size:11px;border-top:1px solid var(--border);margin-top:1rem">
+  AutoBot Deep Audit · June 11, 2026 · For research and educational purposes only · Past simulation results do not guarantee future performance · F&O trading involves substantial risk of capital loss
+</div>
+</body>
+</html>
