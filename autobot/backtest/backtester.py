@@ -285,9 +285,28 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
                     pheromone.reinforce("choppy_condor", condor_pnl)
             equity.append(broker.capital)
             continue
+        # Default to spread unless confidence is high and VIX is expanding
+        use_spread = True
+        if plan.confidence > 0.70 and today.vix > 18:
+            use_spread = False
+
         kind = "C" if plan.action == "BUY_CE" else "P"
-        entry_prem = bs_price(spot, plan.strike, r, iv, t_exp, kind)
-        if entry_prem < 5:
+
+        if use_spread:
+            from ..strategy.intraday import SpreadStrategy
+            spread_strat = SpreadStrategy()
+            if kind == "C":
+                spread = spread_strat.bull_call_spread(spot, plan.strike, wing=100)
+            else:
+                spread = spread_strat.bear_put_spread(spot, plan.strike, wing=100)
+
+            entry_prem_buy = bs_price(spot, spread["buy"], r, iv, t_exp, kind)
+            entry_prem_sell = bs_price(spot, spread["sell"], r, iv, t_exp, kind)
+            entry_prem = entry_prem_buy - entry_prem_sell
+        else:
+            entry_prem = bs_price(spot, plan.strike, r, iv, t_exp, kind)
+
+        if entry_prem < 5 and not use_spread:
             equity.append(broker.capital)
             continue
 
@@ -319,9 +338,26 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
             continue
         # Honest fill model on daily bars: hold open->close unless disaster stop breached
         adv_spot = today.Low if kind == "C" else today.High
-        prem_adv = bs_price(adv_spot, plan.strike, r, iv, t_exp - 0.25 / 365, kind)
-        prem_close = bs_price(today.Close, plan.strike, r, iv, t_exp - 1 / 365, kind)
+
+        if use_spread:
+            prem_adv_buy = bs_price(adv_spot, spread["buy"], r, iv, t_exp - 0.25 / 365, kind)
+            prem_adv_sell = bs_price(adv_spot, spread["sell"], r, iv, t_exp - 0.25 / 365, kind)
+            prem_adv = prem_adv_buy - prem_adv_sell
+
+            prem_close_buy = bs_price(today.Close, spread["buy"], r, iv, t_exp - 1 / 365, kind)
+            prem_close_sell = bs_price(today.Close, spread["sell"], r, iv, t_exp - 1 / 365, kind)
+            prem_close = prem_close_buy - prem_close_sell
+        else:
+            prem_adv = bs_price(adv_spot, plan.strike, r, iv, t_exp - 0.25 / 365, kind)
+            prem_close = bs_price(today.Close, plan.strike, r, iv, t_exp - 1 / 365, kind)
+
         exit_px = disaster if prem_adv <= disaster else prem_close
+
+        # Max profit logic for spreads
+        if use_spread:
+            if exit_px > spread["max_profit_pts"]:
+                exit_px = spread["max_profit_pts"]
+
         pnl = broker.close(pos, exit_px)
         risk.register_pnl(pnl)
 
