@@ -64,7 +64,7 @@ def load_history(years=20):
                        progress=False, group_by="ticker", auto_adjust=True)
     for name, tkr in FACTOR_TICKERS.items():
         try:
-            chg = data[tkr]["Close"].pct_change() * 100
+            chg = data[tkr]["Close"].pct_change(fill_method=None) * 100
             df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").shift(1).fillna(0.0)
         except Exception:
             df[f"{name}_chg"] = 0.0
@@ -95,13 +95,14 @@ def load_event_impacts():
 
 
 
-def days_to_expiry(date):
+def days_to_nifty_expiry(dt):
     from datetime import timedelta
-    d = date
-    while d.weekday() != 1:  # 1 = Tuesday
+    d = dt.date() if hasattr(dt, 'date') else dt
+    days = 0
+    while d.weekday() != 1:   # 1 = Tuesday
         d += timedelta(days=1)
-    delta = (d - date).days
-    return max(0.1, delta) / 365.0
+        days += 1
+    return max(0.1, days) / 365.0
 
 def _clip(x):
     return max(-1.0, min(1.0, x))
@@ -129,6 +130,14 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
                  confidence_threshold=0.50, daily_max_loss_pct=3.0,
                  daily_profit_target_pct=7.5, disaster_atr_mult=2.0,
                  dd_throttle=0.10, dd_threshold_bump=0.07):
+    import yaml
+    try:
+        with open("config.yaml", "r") as f:
+            cfg = yaml.safe_load(f)
+            regimes_cfg = cfg.get("regimes", {})
+    except Exception:
+        regimes_cfg = {}
+
     qty = lots * lot_size
     broker = PaperBroker(capital)
     risk = RiskManager(daily_profit_target=capital * daily_profit_target_pct / 100,
@@ -141,29 +150,43 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
     trades, equity = [], []
     peak_eq = capital
     rows = list(df.itertuples())
+    from ..strategy.regime import RegimeDetector
+    regime_detector = RegimeDetector()
     for i in range(2, len(rows)):
         pheromone.evaporate()
         prev, today = rows[i - 1], rows[i]
         risk.new_day()
         spot = today.Open
         iv = max(today.vix, 8.0) / 100.0
-        t_exp = days_to_expiry(today.Index.date())
+        t_exp = days_to_nifty_expiry(today.Index)
         signals = build_signals(prev, today, rows[i - 2].Close)
+        regime = regime_detector.classify(vix=today.vix, adx=today.adx if "adx" in df.columns else 0.0, atr_pct=(today.atr / spot) * 100)
+
+        # Load threshold from config
+        if regime == "CHOPPY" and "choppy" in regimes_cfg:
+            engine.threshold = regimes_cfg["choppy"].get("confidence_threshold", 0.55)
+        elif regime == "HIGH_VOLATILITY" and "high_volatility" in regimes_cfg:
+            engine.threshold = regimes_cfg["high_volatility"].get("confidence_threshold", 0.65)
+        else:
+            engine.threshold = regimes_cfg.get("trending", {}).get("confidence_threshold", 0.58)
+
         # Drawdown-adaptive throttle: trade less while wounded (immune response)
         peak_eq = max(peak_eq, broker.capital)
         in_drawdown = (peak_eq - broker.capital) / peak_eq > dd_throttle
-        engine.threshold = confidence_threshold # Removed dd_threshold bump to allow more trades
+        if in_drawdown:
+            engine.threshold += dd_threshold_bump   # bump the REGIME threshold, not the top-level one
+
         import pandas as pd
         current_time_sim = pd.to_datetime(today.Index).to_pydatetime().replace(hour=9, minute=15)
         # Event sentiment: decaying impact of major historical news
         sentiment_impact = events.get(today.Index.date(), 0.0)
         plan = engine.decide(signals, spot, sentiment_impact=sentiment_impact)
         # Trend-regime gate: never fight the established trend
-        uptrend = prev.Close > prev.sma50 and prev.sma20 > prev.sma50
-        downtrend = prev.Close < prev.sma50 and prev.sma20 < prev.sma50
+        uptrend   = prev.Close > prev.sma50 * 1.005
+        downtrend = prev.Close < prev.sma50 * 0.995
                 # Priority 4: Re-enables CE trades in bearish regime and PE trades in bullish regime if near SMA50.
-        uptrend = prev.Close > prev.sma50 and prev.sma20 > prev.sma50
-        downtrend = prev.Close < prev.sma50 and prev.sma20 < prev.sma50
+        uptrend   = prev.Close > prev.sma50 * 1.005
+        downtrend = prev.Close < prev.sma50 * 0.995
         near_sma = abs(prev.Close / prev.sma50 - 1) < 0.005
 
         if plan is not None:
@@ -171,7 +194,29 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
                 plan = None
             elif plan.action == "BUY_PE" and not (downtrend or near_sma):
                 plan = None
-        if plan is None or plan.action == "NO_TRADE" or not risk.can_trade(len(broker.positions)):
+        if plan is None or plan.action == "NO_TRADE":
+            if regime == "CHOPPY":
+                from ..strategy.intraday import ChoppyMarketStrategy
+                choppy = ChoppyMarketStrategy()
+                condor_action = choppy.evaluate_iron_condor(today.vix)
+                if condor_action in ("SELL_IRON_CONDOR", "SELL_NARROW_CONDOR"):
+                    wing = 75 if condor_action == "SELL_IRON_CONDOR" else 50
+                    atm = round(spot / 50) * 50
+                    span_margin = wing * lot_size * 1.5
+                    condor_lots = max(1, int(broker.capital * 0.50 / span_margin))
+                    sell_p = bs_price(spot, atm - wing//2, r, iv, t_exp, "P")
+                    buy_p  = bs_price(spot, atm - wing,    r, iv, t_exp, "P")
+                    sell_c = bs_price(spot, atm + wing//2, r, iv, t_exp, "C")
+                    buy_c  = bs_price(spot, atm + wing,    r, iv, t_exp, "C")
+                    credit = (sell_p - buy_p + sell_c - buy_c) * condor_lots * lot_size
+                    stayed_in = abs(today.Close - spot) < wing
+                    condor_pnl = credit if stayed_in else -wing * condor_lots * lot_size * 0.5
+                    risk.register_pnl(condor_pnl)
+                    trades.append({"date": str(today.Index.date()), "action": condor_action,
+                                   "strike": atm, "entry": round(sell_p, 2),
+                                   "exit": round(buy_p, 2), "pnl": round(condor_pnl, 2),
+                                   "confidence": 0.60})
+                    pheromone.reinforce("choppy_condor", condor_pnl)
             equity.append(broker.capital)
             continue
         kind = "C" if plan.action == "BUY_CE" else "P"

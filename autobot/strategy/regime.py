@@ -1,12 +1,13 @@
 class RegimeDetector:
-    """Classifies the market regime using VIX, ADX, and ATR."""
+    def __init__(self, vix_low=14.0, vix_high=20.0):
+        self.vix_low = vix_low
+        self.vix_high = vix_high
 
-    def classify(self, vix, adx=0, atr_pct=0):
-        # ADX takes priority — VIX alone is insufficient (Priority 5)
-        if adx > 25: # Using 25 based on Priority 5 text "ADX>25 -> TRENDING" (even though drop-in code had 28, sticking to the textual instruction)
+    def classify(self, vix, adx=0, atr_pct=None):
+        if adx > 28:
             return "TRENDING"
-        if vix > 20 or atr_pct > 0.65:
-            return "HIGH_VOLATILITY"
-        if vix < 14 and atr_pct < 0.30 and adx < 18:
+        if vix < self.vix_low and (atr_pct is None or atr_pct < 0.30):
             return "CHOPPY"
-        return "TRENDING"  # default: attempt the trade
+        elif vix > self.vix_high:
+            return "HIGH_VOLATILITY"
+        return "TRENDING"
