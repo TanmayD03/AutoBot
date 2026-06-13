@@ -88,3 +88,18 @@ def combine(signals, weights=None):
     agree = sum(1 for s in signals if s.score * score > 0) / len(signals)
     conf = min(1.0, abs(score) * 0.5 + agree * 0.5)
     return _clip(score), conf
+
+def iv_skew_signal(iv_pe, iv_ce):
+    """
+    Positive skew (PE IV > CE IV) = bearish bias.
+    Negative skew (CE IV > PE IV) = unusual bullish pressure.
+    """
+    skew = iv_pe - iv_ce
+    score = _clip(-skew / 0.05)  # 5% skew = maximum signal
+    return SignalScore("iv_skew", score, 0.65)
+
+def max_pain_signal(spot, max_pain_strike):
+    """Distance from max pain normalized to [-1, +1]."""
+    distance_pct = (spot - max_pain_strike) / spot * 100
+    # Nifty 200pts above max pain → negative signal (expect fall)
+    return SignalScore("max_pain", _clip(-distance_pct / 1.5), 0.65)

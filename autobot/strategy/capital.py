@@ -26,3 +26,15 @@ class CapitalManager:
             lots = 1
 
         return lots
+
+    def calculate_lots_by_delta(self, capital, option_premium, delta, target_delta_exposure=0.50, lot_size=75):
+        """
+        Size position so total delta exposure equals target.
+        target_delta_exposure: fraction of capital you want exposed per 1pt Nifty move.
+        """
+        base_lots = self.calculate_lots(capital, option_premium)
+        if abs(delta) < 0.05:
+            return 1
+        delta_adjusted = max(1, int(base_lots * target_delta_exposure / abs(delta)))
+        max_lots = int(capital * self.max_risk_per_trade_pct / (option_premium * lot_size))
+        return min(delta_adjusted, max(1, max_lots))

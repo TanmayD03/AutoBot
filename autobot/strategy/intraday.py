@@ -4,13 +4,22 @@ class IntradayFlipper:
     def __init__(self):
         pass
 
-    def evaluate_entry(self, current_time, spot, vwap, rsi, adx, pdh, dma20, dma50, vix, gift_nifty_gap):
+    def evaluate_entry(self, current_time, spot, vwap, rsi, adx, pdh, dma20, dma50, vix, gift_nifty_gap, orb_high=None, orb_low=None):
         if current_time and getattr(current_time, 'hour', 0) == 9 and getattr(current_time, 'minute', 0) <= 45:
             if vix > 14 and abs(gift_nifty_gap) > 0.3:
                 if spot > vwap and gift_nifty_gap > 0:
                     return "BUY_CE"
                 elif spot < vwap and gift_nifty_gap < 0:
                     return "BUY_PE"
+
+        # ORB breakout check (fires after 9:45 AM)
+        if (current_time and getattr(current_time, 'hour', 0) >= 9
+            and getattr(current_time, 'minute', 0) > 45
+            and orb_high and orb_low):
+            if spot > orb_high and adx > 20 and gift_nifty_gap > 0.3:
+                return "BUY_CE"   # upside breakout confirmed
+            elif spot < orb_low and adx > 20 and gift_nifty_gap < -0.3:
+                return "BUY_PE"   # downside breakout confirmed
 
         if adx > 20:
             bullish = spot > dma20 and spot > vwap
@@ -61,3 +70,14 @@ class ChoppyMarketStrategy:
         elif spot > vwap * 1.0025 and rsi > 65:
             return "BUY_PE_SCALP"
         return "NO_TRADE"
+
+class SpreadStrategy:
+    def bear_put_spread(self, spot, atm, wing=100):
+        # Buy ATM PE, Sell (ATM-wing) PE
+        return {"buy": atm, "sell": atm - wing, "kind": "P",
+                "max_profit_pts": wing, "note": "capped upside, defined loss"}
+
+    def bull_call_spread(self, spot, atm, wing=100):
+        # Buy ATM CE, Sell (ATM+wing) CE
+        return {"buy": atm, "sell": atm + wing, "kind": "C",
+                "max_profit_pts": wing, "note": "capped upside, defined loss"}

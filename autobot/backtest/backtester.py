@@ -45,6 +45,7 @@ def load_history(years=20):
     df["sma20"] = df["Close"].rolling(20).mean()
     df["sma50"] = df["Close"].rolling(50).mean()
     df["atr"] = (df["High"] - df["Low"]).rolling(14).mean()
+    df["vix_pct_rank"] = df["vix"].rolling(252).rank(pct=True) * 100
     # Calculate basic ADX(14)
     high_diff = df["High"].diff()
     low_diff = df["Low"].diff()
@@ -114,7 +115,7 @@ def build_signals(prev, today, prev2_close) -> list:
     macro_raw = (0.40 * today.sp500_chg + 0.15 * today.nikkei_chg - 0.10 * today.brent_chg
                  - 0.15 * today.dxy_chg - 0.10 * today.us10y_chg
                  - 3.0 * 0.25 * today.usdinr_chg) / 1.2
-    return [
+    signals = [
         pivot_signal(today.Open, prev.High, prev.Low, prev.Close),
         vix_signal(today.vix, (today.vix / prev.vix - 1) * 100 if prev.vix else 0),
         SignalScore("gift_gap", _clip(gap_pct), 0.7),
@@ -124,6 +125,18 @@ def build_signals(prev, today, prev2_close) -> list:
         SignalScore("breadth", _clip(today.hw_breadth * 0.8), 0.55),     # heavyweight breadth
         SignalScore("adr", _clip(today.adr_chg / 1.5), 0.6),             # ADR overnight read
     ]
+
+    # Approximate skew from VIX (when VIX > 18, PE skew is typically elevated)
+    iv = max(today.vix, 8.0) / 100.0
+    iv_skew_approx = max(0, (today.vix - 15) / 100)  # proxy until live option chain
+    from ..signals.engine import iv_skew_signal, max_pain_signal
+    signals.append(iv_skew_signal(iv + iv_skew_approx, iv - iv_skew_approx * 0.5))
+
+    # Approximate max pain (assumes spot tends to drift to nearest 50/100 strike)
+    max_pain_strike = round(today.Open / 50) * 50
+    signals.append(max_pain_signal(today.Open, max_pain_strike))
+
+    return signals
 
 
 def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.068,
@@ -159,6 +172,28 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         spot = today.Open
         iv = max(today.vix, 8.0) / 100.0
         t_exp = days_to_nifty_expiry(today.Index)
+
+        # On expiry Tuesday, before the normal signal check:
+        if today.Index.weekday() == 1 and today.vix > 16:
+            atm = round(spot / 50) * 50
+            ce_cost = bs_price(spot, atm, r, iv, t_exp, "C")
+            pe_cost = bs_price(spot, atm, r, iv, t_exp, "P")
+            straddle_cost = ce_cost + pe_cost
+            straddle_lots = max(1, int(broker.capital * 0.20 / (straddle_cost * lot_size)))
+            # Exit when either leg gains 50% OR at 13:00 PM (theta accelerates)
+            # Simulate: use max of CE exit and PE exit at close
+            ce_exit = bs_price(today.Close, atm, r, iv, t_exp * 0.15, "C")
+            pe_exit = bs_price(today.Close, atm, r, iv, t_exp * 0.15, "P")
+            straddle_exit = ce_exit + pe_exit
+            pnl = (straddle_exit - straddle_cost) * straddle_lots * lot_size
+            risk.register_pnl(pnl)
+            trades.append({"date": str(today.Index.date()), "action": "STRADDLE",
+                           "strike": atm, "entry": round(straddle_cost, 2),
+                           "exit": round(straddle_exit, 2), "pnl": round(pnl, 2),
+                           "confidence": 0.80})
+            equity.append(broker.capital)
+            continue
+
         signals = build_signals(prev, today, rows[i - 2].Close)
         regime = regime_detector.classify(vix=today.vix, adx=today.adx if "adx" in df.columns else 0.0, atr_pct=(today.atr / spot) * 100)
 
@@ -176,11 +211,42 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         if in_drawdown:
             engine.threshold += dd_threshold_bump   # bump the REGIME threshold, not the top-level one
 
+        vix_pct = today.vix_pct_rank if "vix_pct_rank" in df.columns else 50.0
+
+        if vix_pct < 25:       # IV cheap → buy options aggressively
+            pos_size_mult = 1.5    # 50% more lots than usual
+            strategy_pref = "BUY_STRADDLE_OR_DIRECTIONAL"
+        elif vix_pct < 60:     # IV moderate → normal directional
+            pos_size_mult = 1.0
+            strategy_pref = "BUY_SPREAD"
+        else:                  # IV expensive → sell spreads/condors
+            pos_size_mult = 0.8
+            strategy_pref = "SELL_CONDOR"
+
         import pandas as pd
         current_time_sim = pd.to_datetime(today.Index).to_pydatetime().replace(hour=9, minute=15)
+        # Approximate ORB from daily bar (first 30-min = ~12% of daily range)
+        orb_high = today.Open + (today.High - today.Open) * 0.15
+        orb_low  = today.Open - (today.Open - today.Low)  * 0.15
+
+        from ..strategy.intraday import IntradayFlipper
+        intraday_flipper = IntradayFlipper()
+        flipper_action = intraday_flipper.evaluate_entry(
+            current_time=current_time_sim,
+            spot=spot, vwap=today.Open, rsi=50, adx=today.adx if "adx" in df.columns else 0.0,
+            pdh=prev.High, dma20=today.sma20, dma50=today.sma50,
+            vix=today.vix,
+            gift_nifty_gap=(today.Open / prev.Close - 1) * 100,
+            orb_high=orb_high, orb_low=orb_low
+        )
+
         # Event sentiment: decaying impact of major historical news
         sentiment_impact = events.get(today.Index.date(), 0.0)
         plan = engine.decide(signals, spot, sentiment_impact=sentiment_impact)
+
+        if flipper_action in ("BUY_CE", "BUY_PE"):
+            from ..signals.engine import DecisionPlan
+            plan = DecisionPlan(action=flipper_action, strike=round(spot/50)*50, confidence=0.75, reason="IntradayFlipper ORB/Morning")
         # Trend-regime gate: never fight the established trend
         uptrend   = prev.Close > prev.sma50 * 1.005
         downtrend = prev.Close < prev.sma50 * 0.995
@@ -224,10 +290,29 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         if entry_prem < 5:
             equity.append(broker.capital)
             continue
+
+        from ..strategy.capital import CapitalManager
+        cap_manager = CapitalManager()
+
+        # Calculate delta for sizing
+        from ..options_math.black_scholes import greeks
+        delta_val = greeks(spot, plan.strike, r, iv, t_exp, kind).delta
+
+        # Determine lots dynamically
+        calc_lots = cap_manager.calculate_lots_by_delta(broker.capital, entry_prem, delta_val, target_delta_exposure=0.50, lot_size=lot_size)
+        if calc_lots == 0:
+            equity.append(broker.capital)
+            continue
+
+        # Apply pos_size_mult calculated earlier based on vix_pct_rank
+        adjusted_qty = int(calc_lots * lot_size * pos_size_mult)
+        if adjusted_qty < lot_size:
+            adjusted_qty = lot_size
+
         # Volatility-aware DISASTER stop: outside normal noise, abnormal days only
         exp_move = 0.5 * prev.atr
         disaster = max(1.0, entry_prem - disaster_atr_mult * exp_move)
-        pos = broker.buy(f"NIFTY{plan.strike}{kind}E", qty, entry_prem, disaster,
+        pos = broker.buy(f"NIFTY{plan.strike}{kind}E", adjusted_qty, entry_prem, disaster,
                          entry_prem + disaster_atr_mult * exp_move * 2.5)
         if pos is None:
             equity.append(broker.capital)
