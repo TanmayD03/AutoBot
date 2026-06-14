@@ -104,3 +104,14 @@ def gamma_exposure(chain, S, r, t, iv=0.15) -> float:
         gex += g * c["call_oi"] * S
         gex -= g * c["put_oi"] * S
     return gex
+
+def get_option_walls(chain):
+    """
+    Finds the Call Wall (highest Call OI strike) and Put Wall (highest Put OI strike).
+    These act as resistance and support levels.
+    """
+    if not chain:
+        return None, None
+    call_wall = max(chain, key=lambda c: c.get("call_oi", 0))["strike"]
+    put_wall = max(chain, key=lambda c: c.get("put_oi", 0))["strike"]
+    return call_wall, put_wall

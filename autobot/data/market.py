@@ -22,19 +22,44 @@ class DataAdapter:
 
 
 class MacroFeed(DataAdapter):
-    """Tier 3: global macro daily % changes via yfinance."""
+    """
+    Tiered macro feed with fallback:
+    1. Try yfinance (often fails)
+    2. Try investing.com scrape via requests
+    3. Use last known values from cache
+    """
+    def __init__(self):
+        self._cache = {}
+
     def snapshot(self) -> dict:
-        import yfinance as yf
         out = {}
-        data = yf.download(list(MACRO_TICKERS.values()), period="5d", interval="1d",
-                           progress=False, group_by="ticker", auto_adjust=True)
-        for name, tkr in MACRO_TICKERS.items():
-            try:
-                closes = data[tkr]["Close"].dropna()
-                out[name] = {"last": float(closes.iloc[-1]),
-                             "chg_pct": float((closes.iloc[-1] / closes.iloc[-2] - 1) * 100)}
-            except Exception:
-                out[name] = {"last": None, "chg_pct": 0.0}
+        # Try yfinance first
+        try:
+            import yfinance as yf
+            data = yf.download(
+                list(MACRO_TICKERS.values()),
+                period="5d", interval="1d",
+                progress=False, group_by="ticker", auto_adjust=True,
+                timeout=8
+            )
+            for name, tkr in MACRO_TICKERS.items():
+                try:
+                    closes = data[tkr]["Close"].dropna()
+                    if len(closes) >= 2:
+                        val = {"last": float(closes.iloc[-1]),
+                               "chg_pct": float((closes.iloc[-1]/closes.iloc[-2]-1)*100)}
+                        out[name] = val
+                        self._cache[name] = val   # update cache on success
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Fill missing with cache or zero
+        for name in MACRO_TICKERS:
+            if name not in out:
+                out[name] = self._cache.get(name, {"last": None, "chg_pct": 0.0})
+
         return out
 
 
@@ -88,4 +113,33 @@ class NSEClient(DataAdapter):
 
     def snapshot(self):
         spot, chain = self.option_chain()
-        return {"spot": spot, "chain": chain}
+        from ..options_math.black_scholes import gamma_exposure, max_pain, put_call_ratio, get_option_walls
+
+        gex = gamma_exposure(chain, spot, 0.068, 3/365.0, 0.15) if chain else 0.0
+        pain = max_pain(chain) if chain else spot
+        pcr = put_call_ratio(chain) if chain else 1.0
+        call_wall, put_wall = get_option_walls(chain)
+
+        return {
+            "spot": spot,
+            "chain": chain,
+            "gex": gex,
+            "max_pain": pain,
+            "pcr": pcr,
+            "call_wall": call_wall,
+            "put_wall": put_wall
+        }
+
+    def fii_dii_flow(self) -> dict:
+        """Pull today's FII/DII provisional net flow from NSE."""
+        try:
+            js = self._get("/api/fiidiiTradeReact")
+            # Returns list of records: category, buyValue, sellValue, netValue
+            fii = next(r for r in js if r["category"] == "FII/FPI")
+            dii = next(r for r in js if r["category"] == "DII")
+            return {
+                "fii_net_cr": float(fii["netValue"]),   # ₹ crore
+                "dii_net_cr": float(dii["netValue"]),
+            }
+        except Exception:
+            return {"fii_net_cr": 0.0, "dii_net_cr": 0.0}

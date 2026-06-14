@@ -69,10 +69,24 @@ def load_history(years=20):
             df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").shift(1).fillna(0.0)
         except Exception:
             df[f"{name}_chg"] = 0.0
+
+    # After all downloads, fill any remaining NaN columns (handles 403 errors on yfinance)
+    for col in ['sp500_chg','nikkei_chg','brent_chg',
+                'dxy_chg','us10y_chg','usdinr_chg','banknifty_chg',
+                'hw_breadth','adr_chg'] + HW_COLS + ADR_COLS:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = df[col].fillna(0.0)
+
     # Heavyweight breadth: fraction of top-5 index anchors green yesterday, in [-1, 1]
     df["hw_breadth"] = sum(np.sign(df[c]) for c in HW_COLS) / len(HW_COLS)
     # ADR composite: average prev-day move of Indian ADRs in the US session
     df["adr_chg"] = sum(df[c] for c in ADR_COLS) / len(ADR_COLS)
+
+    # Mocking FII flow for historical backtest using ADR moves proxy (better than zeros)
+    # In live mode this is pulled from NSE API.
+    df["fii_net_cr"] = df["adr_chg"] * 2500.0
+
     return df.dropna()
 
 
@@ -126,15 +140,31 @@ def build_signals(prev, today, prev2_close) -> list:
         SignalScore("adr", _clip(today.adr_chg / 1.5), 0.6),             # ADR overnight read
     ]
 
+    from ..signals.engine import iv_skew_signal, max_pain_signal, crude_signal, fii_flow_signal
+
+    # Add Crude Regime Signal
+    signals.append(crude_signal(brent_price=80.0, brent_chg_pct=today.brent_chg)) # using 80.0 as mock baseline for backtest where price isn't available
+
+    # Add FII flow signal
+    if hasattr(today, "fii_net_cr"):
+        signals.append(fii_flow_signal(today.fii_net_cr, 0.0))
+    else:
+        signals.append(fii_flow_signal(0.0, 0.0))
+
     # Approximate skew from VIX (when VIX > 18, PE skew is typically elevated)
     iv = max(today.vix, 8.0) / 100.0
     iv_skew_approx = max(0, (today.vix - 15) / 100)  # proxy until live option chain
-    from ..signals.engine import iv_skew_signal, max_pain_signal
     signals.append(iv_skew_signal(iv + iv_skew_approx, iv - iv_skew_approx * 0.5))
 
-    # Approximate max pain (assumes spot tends to drift to nearest 50/100 strike)
-    max_pain_strike = round(today.Open / 50) * 50
-    signals.append(max_pain_signal(today.Open, max_pain_strike))
+    # Approximate max pain (removed as rounding logic forces score ~0.0; wait for live OI data)
+    # max_pain_strike = round(today.Open / 50) * 50
+    # signals.append(max_pain_signal(today.Open, max_pain_strike))
+
+    from ..data.events import get_event_score
+    date_str = str(today.Index.date()) if hasattr(today, "Index") else str(today.name.date())
+    event_score, event_conf = get_event_score(date_str)
+    if event_conf > 0:
+        signals.append(SignalScore("geopolitical", event_score, event_conf))
 
     return signals
 
@@ -211,6 +241,22 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         if in_drawdown:
             engine.threshold += dd_threshold_bump   # bump the REGIME threshold, not the top-level one
 
+        from ..signals.engine import combine
+        # Get raw ensemble score to determine direction for quality check
+        score, _ = combine(signals)
+
+        # Count high-conviction signals (conf > 0.65 AND score in same direction as ensemble)
+        high_conv = sum(1 for s in signals
+                        if s.confidence > 0.65 and s.score * score > 0.10)
+        # Lower threshold when 3+ high-conviction signals agree
+        if high_conv >= 3:
+            engine.threshold = max(0.48, engine.threshold - 0.08)
+        elif high_conv >= 2:
+            engine.threshold = max(0.52, engine.threshold - 0.05)
+        # Raise threshold when only 1 high-conviction signal (avoid low-quality trades)
+        elif high_conv <= 1:
+            engine.threshold = min(0.72, engine.threshold + 0.05)
+
         vix_pct = today.vix_pct_rank if "vix_pct_rank" in df.columns else 50.0
 
         if vix_pct < 25:       # IV cheap → buy options aggressively
@@ -245,8 +291,8 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         plan = engine.decide(signals, spot, sentiment_impact=sentiment_impact)
 
         if flipper_action in ("BUY_CE", "BUY_PE"):
-            from ..signals.engine import DecisionPlan
-            plan = DecisionPlan(action=flipper_action, strike=round(spot/50)*50, confidence=0.75, reason="IntradayFlipper ORB/Morning")
+            from ..strategy.decision import TradePlan
+            plan = TradePlan(action=flipper_action, strike=round(spot/50)*50, confidence=0.75, reason="IntradayFlipper ORB/Morning")
         # Trend-regime gate: never fight the established trend
         uptrend   = prev.Close > prev.sma50 * 1.005
         downtrend = prev.Close < prev.sma50 * 0.995
@@ -255,11 +301,28 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         downtrend = prev.Close < prev.sma50 * 0.995
         near_sma = abs(prev.Close / prev.sma50 - 1) < 0.005
 
+        # Gap vs macro conflict detection — add after build_signals() inside the loop logic
+        gap_s   = next((s for s in signals if s.name == "gift_gap"),  None)
+        macro_s = next((s for s in signals if s.name == "macro"),     None)
+        if (gap_s and macro_s
+            and gap_s.score * macro_s.score < 0        # opposite directions
+            and abs(gap_s.score) > 0.35):              # gap > ~0.35%
+            regime = "CHOPPY"                          # force override
+
         if plan is not None:
-            if plan.action == "BUY_CE" and not (uptrend or near_sma):
-                plan = None
-            elif plan.action == "BUY_PE" and not (downtrend or near_sma):
-                plan = None
+            # Skip trend gate if confidence is high (> 0.65) and 4+ signals agree (quality reversal)
+            # Or if confidence is extremely high (> 0.85)
+            high_conv = sum(1 for s in signals if s.confidence > 0.65 and s.score * plan.confidence > 0.10)
+            bypass_trend = plan.confidence >= 0.85 or (plan.confidence >= 0.65 and high_conv >= 4)
+
+            if not bypass_trend:
+                if plan.action == "BUY_CE" and not (uptrend or near_sma):
+                    plan = None
+                elif plan.action == "BUY_PE" and not (downtrend or near_sma):
+                    plan = None
+
+            if regime == "CHOPPY":
+                plan = None # Choppy logic overrides directional trades
         if plan is None or plan.action == "NO_TRADE":
             if regime == "CHOPPY":
                 from ..strategy.intraday import ChoppyMarketStrategy
