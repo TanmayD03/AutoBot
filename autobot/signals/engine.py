@@ -15,6 +15,33 @@ def _clip(x, lo=-1.0, hi=1.0):
     return max(lo, min(hi, x))
 
 
+def crude_signal(brent_price: float, brent_chg_pct: float) -> SignalScore:
+    """
+    Two components:
+    1. Price level: above $80 = bearish for India, below $70 = bullish
+    2. Daily change: amplifies the level signal
+    """
+    # Level component: normalize $50–$100 range to [-1, +1]
+    level_score = _clip((75.0 - brent_price) / 25.0)   # $75 = neutral
+    # Change component: -4% crash = very bullish for India
+    change_score = _clip(-brent_chg_pct / 5.0)
+    # Combined: level sets context, change gives the day's signal
+    score = 0.40 * level_score + 0.60 * change_score
+    conf  = 0.70 if abs(brent_chg_pct) > 2.0 else 0.50
+    return SignalScore("crude_regime", _clip(score), conf)
+
+def fii_flow_signal(fii_net_cr: float, dii_net_cr: float) -> SignalScore:
+    """
+    FII/DII combined flow. ₹3000cr+ net buy = strong bullish.
+    FII dominates (0.70 weight), DII is counter-cyclical (0.30).
+    """
+    combined = fii_net_cr * 0.70 + dii_net_cr * 0.30
+    # Normalize: ±5000 crore = ±1.0 signal
+    score = _clip(combined / 5000.0)
+    conf  = min(0.90, 0.50 + abs(combined) / 10000.0)
+    return SignalScore("fii_flow", score, conf)
+
+
 def macro_bias(macro: dict) -> SignalScore:
     """Overnight US, Asia, ADRs, Brent (inverse), DXY (inverse), US10Y (inverse)."""
     w = {"sp500": 0.20, "nasdaq": 0.15, "nikkei": 0.10, "kospi": 0.05,
@@ -85,6 +112,31 @@ def combine(signals, weights=None):
         num += w * s.score
         den += w
     score = num / den if den else 0.0
-    agree = sum(1 for s in signals if s.score * score > 0) / len(signals)
+
+    # Only count signals that have a meaningful opinion (|score| > 0.10)
+    active = [s for s in signals if abs(s.score) > 0.10]
+    if active:
+        # Give double weight to high-confidence agreeing signals
+        weighted_agree = sum(s.confidence for s in active if s.score * score > 0)
+        weighted_total = sum(s.confidence for s in active)
+        agree = weighted_agree / weighted_total if weighted_total else 0.5
+    else:
+        agree = 0.5  # no active signals = uncertain
+
     conf = min(1.0, abs(score) * 0.5 + agree * 0.5)
     return _clip(score), conf
+
+def iv_skew_signal(iv_pe, iv_ce):
+    """
+    Positive skew (PE IV > CE IV) = bearish bias.
+    Negative skew (CE IV > PE IV) = unusual bullish pressure.
+    """
+    skew = iv_pe - iv_ce
+    score = _clip(-skew / 0.05)  # 5% skew = maximum signal
+    return SignalScore("iv_skew", score, 0.65)
+
+def max_pain_signal(spot, max_pain_strike):
+    """Distance from max pain normalized to [-1, +1]."""
+    distance_pct = (spot - max_pain_strike) / spot * 100
+    # Nifty 200pts above max pain → negative signal (expect fall)
+    return SignalScore("max_pain", _clip(-distance_pct / 1.5), 0.65)

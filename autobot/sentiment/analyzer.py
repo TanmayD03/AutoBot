@@ -6,14 +6,12 @@ Optional X/Twitter adapter (e.g. @deitaone) requires a paid API key — disabled
 
 EVENT_LEXICON = {
     "geopolitical": (["war", "strike", "attack", "missile", "sanction", "iran", "conflict",
-                      "invasion", "escalat", "tension", "troop"], -0.9),
-    "rates": (["rate hike", "fed raises", "rbi hikes", "hawkish", "tightening", "inflation spike"], -0.5),
-    "rates_dovish": (["rate cut", "dovish", "rbi cuts", "fed cuts", "easing", "pause"], 0.5),
-    "oil_shock": (["crude surge", "oil spike", "brent above", "opec cut", "supply disruption"], -0.6),
-    "macro_negative": (["recession", "default", "crash", "crisis", "plunge", "selloff", "bear market", "panic", "collapse"], -0.7),
-    "macro_positive": (["record high", "rally", "upgrade", "beats estimates", "stimulus", "bull market", "surge", "breakout"], 0.6),
-    "earnings_beat": (["blows past estimates", "strong earnings", "profit jump", "raises guidance", "smash estimates"], 0.5),
-    "earnings_miss": (["misses estimates", "weak earnings", "profit drop", "cuts guidance", "disappoints"], -0.5),
+                      "invasion", "escalat"], -0.9),
+    "rates": (["rate hike", "fed raises", "rbi hikes", "hawkish"], -0.5),
+    "rates_dovish": (["rate cut", "dovish", "rbi cuts", "fed cuts"], 0.5),
+    "oil_shock": (["crude surge", "oil spike", "brent above", "opec cut"], -0.6),
+    "macro_negative": (["recession", "default", "crash", "crisis", "plunge", "selloff"], -0.7),
+    "macro_positive": (["record high", "rally", "upgrade", "beats estimates", "stimulus"], 0.6),
 }
 
 

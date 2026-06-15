@@ -1,5 +1,5 @@
 capital: 100000
-confidence_threshold: 0.7
+confidence_threshold: 0.58
 mode: paper
 nature:
   immune_z_threshold: 4.0
@@ -19,18 +19,25 @@ regimes:
     reward_risk_min: 1.5
     risk_per_trade_pct: 1.5
     theta_timeout_minutes: 60
+  high_volatility:
+    confidence_threshold: 0.65
+    daily_max_loss_pct: 4.0
+    min_delta: 0.4
+    reward_risk_min: 1.8
+    risk_per_trade_pct: 2.0
+    theta_timeout_minutes: 90
   trending:
-    confidence_threshold: 0.62
+    confidence_threshold: 0.58
     daily_max_loss_pct: 3.0
     min_delta: 0.4
     reward_risk_min: 1.8
     risk_per_trade_pct: 2.0
     theta_timeout_minutes: 90
 risk:
-  daily_max_loss_pct: 1.0
+  daily_max_loss_pct: 3.0
   daily_profit_target_pct: 2.5
   max_open_positions: 1
   reward_risk_min: 2.5
-  risk_per_trade_pct: 1.0
+  risk_per_trade_pct: 2.0
   squareoff_time: '15:15'
-  theta_timeout_minutes: 45
+  theta_timeout_minutes: 90

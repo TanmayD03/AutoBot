@@ -1,10 +1,3 @@
-date,category,event,nifty_impact_pct_5d
-2008-01-21,macro_negative,Global financial crisis selloff,-13.0
-2008-10-24,macro_negative,Lehman aftermath capitulation,-12.0
-2013-08-28,rates,Taper tantrum rupee crisis,-5.5
-2016-11-09,macro_negative,Demonetization + US election,-6.0
-2020-03-12,macro_negative,COVID-19 pandemic crash,-22.0
-2020-03-23,macro_negative,COVID lockdown low,-12.0
-2022-02-24,geopolitical,Russia invades Ukraine,-4.8
-2024-06-04,macro_negative,Indian election result shock,-5.9
-2025-04-07,geopolitical,US tariff shock global selloff,-4.5
+date,nifty_impact_pct_5d,headline
+2026-06-08,-6.0,US NFP shock + West Asia escalation
+2026-06-12,7.5,Trump ceasefire announcement
