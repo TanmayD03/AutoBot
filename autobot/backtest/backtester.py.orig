@@ -452,7 +452,7 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
             continue
 
         # Apply pos_size_mult calculated earlier based on vix_pct_rank
-        adjusted_qty = int(calc_lots * pos_size_mult) * lot_size
+        adjusted_qty = int(calc_lots * lot_size * pos_size_mult)
         if adjusted_qty < lot_size:
             adjusted_qty = lot_size
 
