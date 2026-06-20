@@ -274,6 +274,7 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
             pe_exit = max(pe_exit_adv, bs_price(today.Close, atm, r, iv, t_exp * 0.15, "P"))
             straddle_exit = ce_exit + pe_exit
             pnl = (straddle_exit - straddle_cost) * straddle_lots * lot_size
+            broker.capital += pnl
             risk.register_pnl(pnl)
             pheromone.reinforce("STRADDLE", pnl)
             trades.append({"date": str(today.Index.date()), "action": "STRADDLE",
@@ -452,7 +453,7 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
             continue
 
         # Apply pos_size_mult calculated earlier based on vix_pct_rank
-        adjusted_qty = int(calc_lots * pos_size_mult) * lot_size
+        adjusted_qty = max(1, int(calc_lots * pos_size_mult)) * lot_size
         if adjusted_qty < lot_size:
             adjusted_qty = lot_size
 

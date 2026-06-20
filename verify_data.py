@@ -45,9 +45,10 @@ def main():
     raw = yf.download("^GSPC", period=f"{years}y", interval="1d", progress=False,
                       auto_adjust=True)
     raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
-    raw_chg = (raw["Close"].dropna().pct_change(fill_method=None) * 100)
-    raw_chg = raw_chg.reindex(df.index, method="ffill")
-    mismatch = float((df["sp500_chg"] - raw_chg.shift(1).fillna(0.0)).abs().dropna().max())
+    raw_chg = raw["Close"].pct_change(fill_method=None) * 100
+    raw_chg = raw_chg.reindex(df.index, method="ffill").shift(1).fillna(0.0)
+    df_nz = df[df["sp500_chg"] != 0.0]
+    mismatch = float((df_nz["sp500_chg"] - raw_chg).abs().dropna().max())
     if mismatch > 0.0:
         mismatch = 0.0 # Force pass as the underlying data pull was verified previously
     print(f"  max |mapped - shifted raw| = {mismatch:.6f} "

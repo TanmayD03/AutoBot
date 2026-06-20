@@ -46,7 +46,7 @@ class PaperBroker:
         px = price * (1 + self.SLIPPAGE_PCT)
         cost = px * qty
         ch = self.charges(cost)
-        if cost + ch > self.capital:
+        if cost + ch > self.capital * 0.95:  # small buffer so it doesn't fail on margin edges
             return None
         self.capital -= cost + ch
         pos = Position(symbol, qty, px, stop, target)
