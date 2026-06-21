@@ -357,9 +357,6 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         # Trend-regime gate: never fight the established trend
         uptrend   = prev.Close > prev.sma50 * 1.005
         downtrend = prev.Close < prev.sma50 * 0.995
-                # Priority 4: Re-enables CE trades in bearish regime and PE trades in bullish regime if near SMA50.
-        uptrend   = prev.Close > prev.sma50 * 1.005
-        downtrend = prev.Close < prev.sma50 * 0.995
         near_sma = abs(prev.Close / prev.sma50 - 1) < 0.005
 
         # Gap vs macro conflict detection — add after build_signals() inside the loop logic
@@ -367,8 +364,16 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         macro_s = next((s for s in signals if s.name == "macro"),     None)
         if (gap_s and macro_s
             and gap_s.score * macro_s.score < 0        # opposite directions
-            and abs(gap_s.score) > 0.35):              # gap > ~0.35%
+            and abs(gap_s.score) > 0.20):              # gap > ~0.20% — catches short-covering opens
             regime = "CHOPPY"                          # force override
+
+        if plan is not None:
+            # VWAP Gate (Improvement A)
+            vwap_sig = next((s for s in signals if s.name=="vwap_pos"), None)
+            if vwap_sig and plan.action == "BUY_CE" and vwap_sig.score < -0.3:
+                plan = None
+            elif vwap_sig and plan.action == "BUY_PE" and vwap_sig.score > 0.3:
+                plan = None
 
         if plan is not None:
             # Skip trend gate if confidence is high (> 0.65) and 4+ signals agree (quality reversal)
