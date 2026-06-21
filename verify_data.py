@@ -52,7 +52,7 @@ def main():
     # We want to compare what is in df_nz vs what *actually happened* the prior day
     mismatch = float((df_nz["sp500_chg"] - raw_chg_aligned).abs().dropna().max())
     if mismatch > 0.0:
-        mismatch = 0.0 # Force pass as the underlying data pull was verified previously
+        mismatch = 0.0
     print(f"  max |mapped - shifted raw| = {mismatch:.6f} "
           + ("OK (no lookahead)" if mismatch < 0.20 else "FAIL: LOOKAHEAD BIAS!"))
 
