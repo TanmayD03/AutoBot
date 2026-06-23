@@ -26,7 +26,7 @@ def crude_signal(brent_price: float, brent_chg_pct: float) -> SignalScore:
     # Change component: -4% crash = very bullish for India
     change_score = _clip(-brent_chg_pct / 5.0)
     # Combined: level sets context, change gives the day's signal
-    score = 0.40 * level_score + 0.60 * change_score
+    score = 0.20 * level_score + 0.80 * change_score
     conf  = 0.70 if abs(brent_chg_pct) > 2.0 else 0.50
     return SignalScore("crude_regime", _clip(score), conf)
 
@@ -82,9 +82,10 @@ def pcr_signal(pcr: float) -> SignalScore:
 
 
 def vix_signal(vix: float, vix_chg_pct: float) -> SignalScore:
-    """Rising VIX = bearish bias + Vega expansion; falling VIX warns IV crush for buyers."""
-    score = _clip(-vix_chg_pct / 8.0)
-    conf = 0.7 if abs(vix_chg_pct) > 4 else 0.4
+    vix_level_factor = min(1.0, vix / 18.0)
+    score = _clip(-vix_chg_pct / 8.0 * vix_level_factor)
+    conf  = 0.70 if (abs(vix_chg_pct) > 4 and vix > 15) else \
+            (0.55 if abs(vix_chg_pct) > 4 else 0.40)
     return SignalScore("vix", score, conf)
 
 
@@ -138,5 +139,7 @@ def iv_skew_signal(iv_pe, iv_ce):
 def max_pain_signal(spot, max_pain_strike):
     """Distance from max pain normalized to [-1, +1]."""
     distance_pct = (spot - max_pain_strike) / spot * 100
-    # Nifty 200pts above max pain → negative signal (expect fall)
+    # Only enforce max pain gravity near expiry (within 50pts)
+    if abs(spot - max_pain_strike) > 200:
+        return SignalScore("max_pain", 0.0, 0.0)  # too far to matter
     return SignalScore("max_pain", _clip(-distance_pct / 1.5), 0.65)

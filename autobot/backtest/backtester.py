@@ -264,15 +264,16 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
             straddle_cost = straddle_cost_est
             straddle_lots = max(1, int(broker.capital * 0.20 / (straddle_cost * lot_size)))
 
-            # Simulate exiting at intraday peak or max theta-adjusted close:
-            adv_spot_ce = today.High
-            adv_spot_pe = today.Low
-            ce_exit_adv = bs_price(adv_spot_ce, atm, r, iv, t_exp * 0.5, "C")
-            pe_exit_adv = bs_price(adv_spot_pe, atm, r, iv, t_exp * 0.5, "P")
-
-            ce_exit = max(ce_exit_adv, bs_price(today.Close, atm, r, iv, t_exp * 0.15, "C"))
-            pe_exit = max(pe_exit_adv, bs_price(today.Close, atm, r, iv, t_exp * 0.15, "P"))
-            straddle_exit = ce_exit + pe_exit
+            gap_pct_today = (today.Open / prev.Close - 1) * 100
+            t_ce = t_exp * 0.45;  t_pe = t_exp * 0.20
+            if gap_pct_today >= 0:
+                ce_peak = bs_price(today.High, atm, r, iv, t_ce, "C")
+                pe_exit = bs_price(min(today.Low, today.Open * 0.993), atm, r, iv, t_pe, "P")
+            else:
+                pe_peak = bs_price(today.Low,  atm, r, iv, t_pe,  "P")
+                ce_exit = bs_price(max(today.High, today.Open * 1.007), atm, r, iv, t_ce, "C")
+                ce_peak = ce_exit;  pe_exit = pe_peak
+            straddle_exit = max((ce_peak + pe_exit) * 0.85, straddle_cost * 0.30)
             pnl = (straddle_exit - straddle_cost) * straddle_lots * lot_size
             broker.capital += pnl
             risk.register_pnl(pnl)
@@ -314,9 +315,15 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
             engine.threshold = max(0.48, engine.threshold - 0.08)
         elif high_conv >= 2:
             engine.threshold = max(0.52, engine.threshold - 0.05)
-        # Raise threshold when only 1 high-conviction signal (avoid low-quality trades)
-        elif high_conv <= 1:
-            engine.threshold = min(0.72, engine.threshold + 0.05)
+        else:
+            med_conv = sum(1 for s in signals
+                           if 0.50 <= s.confidence <= 0.65 and s.score * score > 0.10)
+            if   high_conv == 1 and med_conv >= 5: engine.threshold = max(0.50, engine.threshold - 0.03)
+            elif high_conv == 1 and med_conv >= 3: engine.threshold = max(0.53, engine.threshold - 0.02)
+            elif high_conv == 1:                   engine.threshold = min(0.68, engine.threshold + 0.03)
+            elif high_conv == 0 and med_conv >= 5: engine.threshold = max(0.50, engine.threshold - 0.03)
+            elif high_conv == 0 and med_conv >= 3: pass  # hold at base
+            else:                                  engine.threshold = min(0.72, engine.threshold + 0.05)
 
         vix_pct = today.vix_pct_rank if "vix_pct_rank" in df.columns else 50.0
 
