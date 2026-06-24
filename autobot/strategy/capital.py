@@ -36,5 +36,7 @@ class CapitalManager:
         if abs(delta) < 0.05:
             return 1
         delta_adjusted = max(1, int(base_lots * target_delta_exposure / abs(delta)))
-        max_lots = int(capital * self.max_risk_per_trade_pct / (option_premium * lot_size))
-        return min(delta_adjusted, max(1, max_lots))
+        max_lots = max(1, int((capital * self.max_risk_per_trade_pct) // (option_premium * lot_size)))
+        if max_lots * option_premium * lot_size > capital * 0.95:
+            max_lots = int((capital * 0.95) // (option_premium * lot_size))
+        return min(delta_adjusted, max_lots)
