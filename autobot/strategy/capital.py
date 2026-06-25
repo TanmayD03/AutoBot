@@ -35,6 +35,8 @@ class CapitalManager:
         base_lots = self.calculate_lots(capital, option_premium)
         if abs(delta) < 0.05:
             return 1
+        if option_premium <= 0:
+            return 0
         delta_adjusted = max(1, int(base_lots * target_delta_exposure / abs(delta)))
         max_lots = max(1, int((capital * self.max_risk_per_trade_pct) // (option_premium * lot_size)))
         if max_lots * option_premium * lot_size > capital * 0.95:

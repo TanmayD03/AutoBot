@@ -86,6 +86,9 @@ def vix_signal(vix: float, vix_chg_pct: float) -> SignalScore:
     score = _clip(-vix_chg_pct / 8.0 * vix_level_factor)
     conf  = 0.70 if (abs(vix_chg_pct) > 4 and vix > 15) else \
             (0.55 if abs(vix_chg_pct) > 4 else 0.40)
+    # NEW: VIX rising from below 14.5 is noise, not fear — further reduce confidence
+    if vix < 14.5 and vix_chg_pct > 0:
+        conf = min(conf, 0.35)
     return SignalScore("vix", score, conf)
 
 
