@@ -84,11 +84,15 @@ def pcr_signal(pcr: float) -> SignalScore:
 def vix_signal(vix: float, vix_chg_pct: float) -> SignalScore:
     vix_level_factor = min(1.0, vix / 18.0)
     score = _clip(-vix_chg_pct / 8.0 * vix_level_factor)
-    conf  = 0.70 if (abs(vix_chg_pct) > 4 and vix > 15) else \
-            (0.55 if abs(vix_chg_pct) > 4 else 0.40)
-    # NEW: VIX rising from below 14.5 is noise, not fear — further reduce confidence
-    if vix < 14.5 and vix_chg_pct > 0:
-        conf = min(conf, 0.35)
+    # LOW-VIX NOISE: when VIX is below 16, a rise is usually reversion not fear
+    if vix < 16.0 and vix_chg_pct > 0:
+        conf = min(0.35, 0.40)   # cap at 0.35 — counts as low-weight noise
+    elif abs(vix_chg_pct) > 4 and vix > 15:
+        conf = 0.70
+    elif abs(vix_chg_pct) > 4:
+        conf = 0.55
+    else:
+        conf = 0.40
     return SignalScore("vix", score, conf)
 
 
