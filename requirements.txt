@@ -10,3 +10,5 @@ pytest>=7.0
 # transformers>=4.40
 # torch
 # neo-api-client  # Kotak Neo official SDK (live mode only)
+kiteconnect>=5.0.1
+python-dotenv>=1.0.0
