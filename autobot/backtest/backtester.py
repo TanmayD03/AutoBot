@@ -236,7 +236,7 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
     engine = DecisionEngine(confidence_threshold, weights=weights)
     events = load_event_impacts()
     from ..nature.pheromone import PheromoneMemory
-    pheromone = PheromoneMemory(["BUY_CE", "BUY_PE", "FLIP_TO_PE", "FLIP_TO_CE"])
+    pheromone = PheromoneMemory(["BUY_CE", "BUY_PE", "FLIP_TO_PE", "FLIP_TO_CE", "STRADDLE", "choppy_condor"])
     trades, equity = [], []
     peak_eq = capital
     rows = list(df.itertuples())
