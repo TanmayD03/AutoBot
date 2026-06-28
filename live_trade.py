@@ -19,9 +19,9 @@ from kiteconnect import KiteTicker
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-def get_next_thursday(today: date) -> date:
-    """NIFTY weekly options typically expire on Thursday."""
-    days_ahead = 3 - today.weekday()
+def get_next_tuesday(today: date) -> date:
+    """NIFTY weekly options typically expire on Tuesday."""
+    days_ahead = 1 - today.weekday()  # 1 = Tuesday
     if days_ahead < 0: # Target next week
         days_ahead += 7
     return today + timedelta(days=days_ahead)
@@ -121,7 +121,7 @@ class LivePaperTrader:
         atm = round(spot / 50) * 50
         kind = "CE" if plan.action == "BUY_CE" else "PE"
         today_date = datetime.now().date()
-        expiry_date = get_next_thursday(today_date)
+        expiry_date = get_next_tuesday(today_date)
 
         logging.info(f"Resolving instrument for NIFTY {atm} {kind} exp {expiry_date}...")
         try:
