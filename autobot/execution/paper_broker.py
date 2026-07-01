@@ -46,8 +46,15 @@ class PaperBroker:
         px = price * (1 + self.SLIPPAGE_PCT)
         cost = px * qty
         ch = self.charges(cost)
+
+        # Circuit breaker: Reject if risk exceeds 60% of capital
+        # (This catches math bugs in position sizing dynamically before they balloon)
+        if cost + ch > self.capital * 0.60:
+            return None
+
         if cost + ch > self.capital * 0.95:  # small buffer so it doesn't fail on margin edges
             return None
+
         self.capital -= cost + ch
         pos = Position(symbol, qty, px, stop, target)
         self.positions.append(pos)
