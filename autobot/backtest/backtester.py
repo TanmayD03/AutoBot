@@ -322,6 +322,7 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
             elif high_conv == 1 and med_conv >= 3: engine.threshold = max(0.53, engine.threshold - 0.02)
             elif high_conv == 1:                   engine.threshold = min(0.68, engine.threshold + 0.03)
             elif high_conv == 0 and med_conv >= 5: engine.threshold = max(0.50, engine.threshold - 0.03)
+            elif high_conv == 0 and med_conv >= 4: engine.threshold = max(0.52, engine.threshold - 0.01)
             elif high_conv == 0 and med_conv >= 3: pass  # hold at base
             else:                                  engine.threshold = min(0.72, engine.threshold + 0.05)
 
@@ -376,11 +377,17 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
 
         if plan is not None:
             # VWAP Gate (Improvement A)
-            vwap_sig = next((s for s in signals if s.name=="vwap_pos"), None)
-            if vwap_sig and plan.action == "BUY_CE" and vwap_sig.score < -0.3:
-                plan = None
-            elif vwap_sig and plan.action == "BUY_PE" and vwap_sig.score > 0.3:
-                plan = None
+            prev_vwap = (prev.High + prev.Low + prev.Close) / 3.0
+            vwap_gap = (today.Open - prev_vwap) / prev_vwap * 100
+
+            adx_val = today.adx if hasattr(today, 'adx') else 18.0
+            vwap_bypass = adx_val > 28 and plan.confidence >= 0.70
+
+            if not vwap_bypass:
+                if plan.action == "BUY_CE" and vwap_gap < -0.30:
+                    plan = None
+                elif plan.action == "BUY_PE" and vwap_gap > 0.30:
+                    plan = None
 
         if plan is not None:
             # Skip trend gate if confidence is high (> 0.65) and 4+ signals agree (quality reversal)
@@ -459,7 +466,16 @@ def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.06
         delta_val = greeks(spot, plan.strike, r, iv, t_exp, kind).delta
 
         # Determine lots dynamically
-        calc_lots = capital_manager.calculate_lots_by_delta(broker.capital, entry_prem, delta_val, target_delta_exposure=0.50, lot_size=lot_size)
+        if use_spread:
+            max_loss_per_unit = spread["max_profit_pts"] - entry_prem   # wing width minus debit paid
+        else:
+            max_loss_per_unit = entry_prem  # naked option: premium can go to zero
+
+        calc_lots = capital_manager.calculate_lots_by_delta(
+            broker.capital, entry_prem, delta_val,
+            target_delta_exposure=0.50, lot_size=lot_size,
+            max_loss_per_unit=max_loss_per_unit
+        )
         if calc_lots == 0:
             equity.append(broker.capital)
             continue
