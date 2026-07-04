@@ -143,6 +143,56 @@ def iv_skew_signal(iv_pe, iv_ce):
     score = _clip(-skew / 0.05)  # 5% skew = maximum signal
     return SignalScore("iv_skew", score, 0.65)
 
+def bollinger_signal(pctb: float) -> SignalScore:
+    """
+    Bollinger %B: 0 = price at lower band, 0.5 = at the mean, 1 = at upper band.
+    Mean-reversion framing: pinned at a band edge tends to snap back toward
+    the mean, so score is the INVERSE of the extremity (contrarian).
+    """
+    extremity = _clip((pctb - 0.5) * 2)          # -1 at lower band, +1 at upper band
+    score = _clip(-extremity * 0.6)               # contrarian: near upper band -> bearish lean
+    conf = 0.60 if abs(extremity) > 0.6 else 0.35  # only confident when actually near a band
+    return SignalScore("bollinger", score, conf)
+
+
+def stochastic_signal(k: float, d: float) -> SignalScore:
+    """
+    Stochastic Oscillator (14,3): overbought >80, oversold <20 — contrarian
+    framing, same spirit as Bollinger. %K crossing above %D adds a small
+    momentum kicker in the same direction as the contrarian call.
+    """
+    if k >= 80:
+        base = -0.6
+    elif k <= 20:
+        base = 0.6
+    else:
+        base = _clip((50 - k) / 40.0 * 0.4)   # mild pull toward mean elsewhere
+    cross_kicker = 0.15 if (k > d and base > 0) or (k < d and base < 0) else 0.0
+    score = _clip(base + cross_kicker)
+    conf = 0.55 if (k >= 80 or k <= 20) else 0.30
+    return SignalScore("stochastic", score, conf)
+
+
+def ma_trend_signal(price: float, ma_fast: float, ma_mid: float, ma_slow: float) -> SignalScore:
+    """
+    Trend-alignment across three moving averages (e.g. 20/50/200 SMA or EMA).
+    Fully bullish stack (price > fast > mid > slow) or fully bearish stack
+    score at the extremes; a tangled/crossed stack scores near zero with low
+    confidence, since that's a genuinely undecided/choppy setup.
+    """
+    bull_stack = price > ma_fast > ma_mid > ma_slow
+    bear_stack = price < ma_fast < ma_mid < ma_slow
+    if bull_stack:
+        return SignalScore("ma_trend", 0.7, 0.65)
+    if bear_stack:
+        return SignalScore("ma_trend", -0.7, 0.65)
+    # Partial alignment: score by how many of the 3 pairwise comparisons agree
+    comparisons = [price > ma_fast, ma_fast > ma_mid, ma_mid > ma_slow]
+    agree_bull = sum(comparisons)
+    score = _clip((agree_bull - 1.5) / 1.5 * 0.5)  # -0.5..+0.5 for partial stacks
+    return SignalScore("ma_trend", score, 0.30)
+
+
 def max_pain_signal(spot, max_pain_strike):
     """Distance from max pain normalized to [-1, +1]."""
     distance_pct = (spot - max_pain_strike) / spot * 100
