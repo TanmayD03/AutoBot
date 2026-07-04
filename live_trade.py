@@ -19,7 +19,9 @@ from autobot.strategy.expiry import ExpiryDayStrategy
 from autobot.nature.immune import ImmuneSystem
 from autobot.sentiment.ensemble import SentimentEnsemble
 from autobot.options_math.black_scholes import implied_vol, greeks, max_pain, put_call_ratio
-from autobot.signals.engine import pcr_signal, max_pain_signal, oi_walls_signal, iv_skew_signal
+from autobot.signals.engine import (pcr_signal, max_pain_signal, oi_walls_signal, iv_skew_signal,
+                                    fii_flow_signal, SignalScore, _clip)
+from autobot.data.market_feed import MarketDataFeed, MarketPreFlightMatrix, GiftNiftyTracker
 from autobot.execution.paper_broker import PaperBroker
 
 from kiteconnect import KiteTicker
@@ -108,6 +110,16 @@ class LivePaperTrader:
         self.sent_score = 0.0
         self.today_row = None  # today's daily indicator row (vix/dma/rsi/adx), stashed for reuse
 
+        # FII/DII (NSE, no Kite equivalent) + US ADR (direct Yahoo JSON, lower
+        # latency than the yfinance library) + GIFT Nifty (tvDatafeed primary,
+        # NSE marketStatus fallback). Explicit exception to the Kite-only rule
+        # per instruction — nothing else in this system scrapes anything.
+        self.raw_feed = MarketDataFeed()
+        self.matrix_processor = MarketPreFlightMatrix(self.raw_feed)
+        self.gift_tracker = GiftNiftyTracker()
+        self.overnight_risk_multiplier = 1.0   # halved on a bearish overnight FII/ADR matrix
+        self.allow_flipper = False              # True once GIFT Nifty is confirmed reachable
+
         # Reconnect / shutdown state for the websocket
         self._intentional_close = False
         self._reconnect_attempts = 0
@@ -148,6 +160,66 @@ class LivePaperTrader:
         self.current_regime = regime  # stashed for regime-aware sizing/strategy selection
 
         logging.info(f"Regime Detected: {regime}")
+
+        # --- Live FII/DII + ADR pre-flight matrix (NSE FII/DII, direct Yahoo ADR JSON) ---
+        # Replaces the historical ADR-based proxy build_signals() uses for both
+        # "fii_flow" and "adr" — that proxy exists only because real FII/DII
+        # history isn't available for years of backtesting. Live mode has the
+        # real thing, so use it.
+        try:
+            morning_state = self.matrix_processor.generate_morning_matrix()
+            logging.info(f"[PRE-FLIGHT] Regime: {morning_state['regime']} (bias {morning_state['bias_score']}), "
+                        f"FII net Rs {morning_state['fii_net_cr']} Cr, DII net Rs {morning_state['dii_net_cr']} Cr, "
+                        f"ADR bias {morning_state['adr_bias_pct']:+.2f}%")
+
+            real_fii_signal = fii_flow_signal(morning_state['fii_net_cr'], morning_state['dii_net_cr'])
+            signals = [s for s in signals if s.name != "fii_flow"] + [real_fii_signal]
+
+            real_adr_signal = SignalScore("adr", _clip(morning_state['adr_bias_pct'] / 1.5), 0.65)
+            signals = [s for s in signals if s.name != "adr"] + [real_adr_signal]
+
+            # From the reference design: halve size on a bearish overnight
+            # matrix rather than blocking trades outright — this multiplies
+            # into risk_pct at execution time in each _execute_* method.
+            self.overnight_risk_multiplier = 0.5 if morning_state['regime'] == "BEARISH" else 1.0
+            if morning_state['regime'] == "BEARISH":
+                logging.info("[RISK] Bearish overnight FII/DII+ADR bias — position sizing halved today.")
+        except Exception as e:
+            logging.warning(f"Pre-flight FII/DII/ADR matrix failed ({e}); using historical proxy signals instead.")
+            self.overnight_risk_multiplier = 1.0
+
+        # --- GIFT Nifty: tvDatafeed primary, NSE marketStatus fallback ---
+        gift_price = None
+        gift_snapshot = self.gift_tracker.fetch_live_snapshot()
+        if "error" not in gift_snapshot:
+            gift_price = gift_snapshot["live_price"]
+            logging.info(f"[GUARD] GIFT Nifty (NSEIX NIFTY1! via tvDatafeed): {gift_price} "
+                        f"@ {gift_snapshot['timestamp']}")
+        else:
+            logging.warning(f"tvDatafeed GIFT Nifty failed ({gift_snapshot['error']}); trying NSE fallback...")
+            nse_gift = self.raw_feed.fetch_gift_nifty_live()
+            if isinstance(nse_gift, dict) and nse_gift.get("last"):
+                gift_price = float(nse_gift["last"])
+                logging.info(f"[GUARD] GIFT Nifty (NSE marketStatus fallback): {gift_price}")
+
+        self.allow_flipper = gift_price is not None
+        if not self.allow_flipper:
+            logging.warning("[GUARD] GIFT Nifty unreachable from both sources this session. "
+                            "(IntradayFlipper is not yet wired into execution, so this flag is "
+                            "informational only for now — see prior notes on why.)")
+        else:
+            # Real overnight gap: GIFT Nifty futures vs YESTERDAY's actual NIFTY
+            # close (today.Close here, since 'today' is the most recently
+            # completed session — today's own bar doesn't exist pre-market).
+            # This replaces build_signals()'s gift_gap, which used today.Open —
+            # not populated until AFTER market open, so pre-market it was
+            # silently reflecting a stale, already-known historical gap.
+            real_gap_pct = (gift_price / today.Close - 1) * 100
+            real_gift_signal = SignalScore("gift_gap", _clip(real_gap_pct), 0.70) if abs(real_gap_pct) >= 0.10 \
+                else SignalScore("gift_gap", 0.0, 0.0)
+            signals = [s for s in signals if s.name != "gift_gap"] + [real_gift_signal]
+            logging.info(f"[PRE-FLIGHT] Real overnight gap vs GIFT Nifty: {real_gap_pct:+.2f}%")
+
         for s in signals:
             logging.info(f"  Signal {s.name}: Score {s.score:.2f}, Conf {s.confidence:.2f}")
 
@@ -317,7 +389,8 @@ class LivePaperTrader:
             logging.warning(f"IV/delta solve failed ({e}); falling back to ATM delta=0.5")
             delta = 0.5 if opt_kind == "C" else -0.5
 
-        risk_pct = self.capital_manager.regime_confidence_risk_pct(self.current_regime, plan.confidence)
+        risk_pct = self.capital_manager.regime_confidence_risk_pct(self.current_regime, plan.confidence) \
+            * self.overnight_risk_multiplier
         lots = self.capital_manager.calculate_lots_by_delta(
             self.broker.capital, entry_prem, delta,
             lot_size=leg["lot_size"], risk_pct_override=risk_pct)
@@ -376,7 +449,7 @@ class LivePaperTrader:
             return False
 
         lot_size = ce_short["lot_size"]
-        risk_pct = self.capital_manager.regime_confidence_risk_pct("CHOPPY", 0.70)
+        risk_pct = self.capital_manager.regime_confidence_risk_pct("CHOPPY", 0.70) * self.overnight_risk_multiplier
         lots = self.capital_manager.calculate_lots_by_max_loss(
             self.broker.capital, max_loss_per_unit, lot_size=lot_size, risk_pct_override=risk_pct)
         if lots <= 0:
@@ -430,7 +503,7 @@ class LivePaperTrader:
 
         lot_size = buy_leg["lot_size"]
         risk_pct = self.capital_manager.regime_confidence_risk_pct(
-            self.current_regime, plan.confidence if plan else 0.70)
+            self.current_regime, plan.confidence if plan else 0.70) * self.overnight_risk_multiplier
         lots = self.capital_manager.calculate_lots_by_max_loss(
             self.broker.capital, max_loss_per_unit, lot_size=lot_size, risk_pct_override=risk_pct)
         if lots <= 0:
@@ -485,7 +558,7 @@ class LivePaperTrader:
         lots = self.capital_manager.calculate_lots_by_delta(
             self.broker.capital, entry_prem, delta=0.35 if kind == "CE" else -0.35,
             lot_size=leg["lot_size"],
-            risk_pct_override=self.capital_manager.max_risk_per_trade_pct * 0.5)
+            risk_pct_override=self.capital_manager.max_risk_per_trade_pct * 0.5 * self.overnight_risk_multiplier)
         if lots <= 0:
             logging.warning("Expiry-day trade not affordable within risk cap — skipping.")
             return
