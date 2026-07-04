@@ -107,4 +107,28 @@ class CapitalManager:
         else:
             mult = 1.0
 
-        return base * mult
+        # Hard ceiling at 55%: PaperBroker rejects any trade whose worst-case
+        # risk exceeds 60% of capital (a safety circuit breaker independent of
+        # this method). Without this cap, a high-confidence TRENDING signal
+        # could compute a risk_pct above that breaker and get silently
+        # rejected at the broker level after already being "sized".
+        return min(0.55, base * mult)
+
+    def calculate_lots_by_max_loss(self, capital, max_loss_per_unit, lot_size=75, risk_pct_override=None):
+        """
+        Generic defined-risk sizer for multi-leg trades (spreads, iron condors)
+        where the true worst case is max_loss_per_unit per unit — e.g.
+        wing_width - net_credit for a condor, or wing_width - net_debit for a
+        debit spread. Deliberately separate from calculate_lots_by_delta:
+        a credit spread's net premium is cash IN, not risk, so sizing off the
+        premium the way a naked option is sized would understate real risk.
+        """
+        if max_loss_per_unit <= 0:
+            return 0
+        risk_pct = risk_pct_override if risk_pct_override is not None else self.max_risk_per_trade_pct
+        max_capital_to_risk = capital * risk_pct
+        cost_per_lot = max_loss_per_unit * lot_size
+        lots = int(max_capital_to_risk // cost_per_lot)
+        if lots == 0:
+            return 1 if cost_per_lot <= capital else 0
+        return lots
