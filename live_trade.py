@@ -18,11 +18,12 @@ from autobot.strategy.intraday import ChoppyMarketStrategy, SpreadStrategy
 from autobot.strategy.expiry import ExpiryDayStrategy
 from autobot.nature.immune import ImmuneSystem
 from autobot.sentiment.ensemble import SentimentEnsemble
-from autobot.options_math.black_scholes import implied_vol, greeks, max_pain, put_call_ratio
+from autobot.options_math.black_scholes import implied_vol, greeks, max_pain, put_call_ratio, get_option_walls
 from autobot.signals.engine import (pcr_signal, max_pain_signal, oi_walls_signal, iv_skew_signal,
                                     fii_flow_signal, SignalScore, _clip)
 from autobot.data.market_feed import MarketDataFeed, MarketPreFlightMatrix, GiftNiftyTracker
 from autobot.execution.paper_broker import PaperBroker
+from autobot.terminal.dashboard import Dashboard
 
 from kiteconnect import KiteTicker
 
@@ -119,6 +120,22 @@ class LivePaperTrader:
         self.gift_tracker = GiftNiftyTracker()
         self.overnight_risk_multiplier = 1.0   # halved on a bearish overnight FII/ADR matrix
         self.allow_flipper = False              # True once GIFT Nifty is confirmed reachable
+
+        # Live monitoring dashboard (rich terminal panels). Runs as a periodic
+        # full-state snapshot from a background thread rather than a
+        # persistent redrawing pane — a Live-updating pane fighting with
+        # normal logging.info() output from another thread is a real rich
+        # limitation, and a snapshot every N seconds is more robust for a
+        # session where correctness matters more than polish.
+        self.dashboard = Dashboard()
+        self.trade_log = []           # human-readable entry/exit lines, newest last
+        self.last_headlines = []
+        self.last_pcr = None
+        self.last_max_pain = None
+        self.last_call_wall = None
+        self.last_put_wall = None
+        self._dashboard_thread = None
+        self.last_tick_time = time.time()
 
         # Reconnect / shutdown state for the websocket
         self._intentional_close = False
@@ -228,6 +245,7 @@ class LivePaperTrader:
         try:
             headlines = self.sentiment.fetch_headlines()
             sent_score, sent_conf = self.sentiment.score(headlines)
+            self.last_headlines = headlines  # cached for the dashboard's sentiment panel
             logging.info(f"Sentiment: score={sent_score:+.2f} conf={sent_conf:.2f} "
                          f"from {len(headlines)} headlines")
         except Exception as e:
@@ -277,6 +295,9 @@ class LivePaperTrader:
             if chain:
                 pcr = put_call_ratio(chain)
                 pain = max_pain(chain)
+                call_wall, put_wall = get_option_walls(chain)
+                self.last_pcr, self.last_max_pain = pcr, pain
+                self.last_call_wall, self.last_put_wall = call_wall, put_wall
                 extra_signals.append(pcr_signal(pcr))
                 extra_signals.append(max_pain_signal(spot, pain))
                 extra_signals.append(oi_walls_signal(chain, spot))
@@ -416,6 +437,7 @@ class LivePaperTrader:
 
         logging.info(f"EXECUTED NAKED TRADE: Bought {qty} ({lots} lots, delta={delta:.2f}, "
                     f"regime={self.current_regime}, risk_pct={risk_pct*100:.1f}%) of {tsym} at {entry_prem}")
+        self.trade_log.append(f"{datetime.now():%H:%M:%S} ENTRY NAKED {tsym} qty={qty} @ Rs{entry_prem:.1f}")
 
     def _execute_condor(self, spot, expiry_date) -> bool:
         """
@@ -477,6 +499,8 @@ class LivePaperTrader:
                     f"max loss/unit {max_loss_per_unit:.2f}. SELL {ce_short['tradingsymbol']}, "
                     f"BUY {ce_long['tradingsymbol']}, SELL {pe_short['tradingsymbol']}, "
                     f"BUY {pe_long['tradingsymbol']}.")
+        self.trade_log.append(f"{datetime.now():%H:%M:%S} ENTRY CONDOR ({classification}) "
+                              f"lots={lots} net_credit={net_credit:.1f}")
         return True
 
     def _execute_spread(self, spot, plan, expiry_date):
@@ -526,6 +550,8 @@ class LivePaperTrader:
         direction = "BULL CALL" if bullish else "BEAR PUT"
         logging.info(f"EXECUTED {direction} SPREAD: {lots} lots, net debit {net_debit:.2f} (max loss/unit). "
                     f"BUY {buy_leg['tradingsymbol']}, SELL {sell_leg['tradingsymbol']}.")
+        self.trade_log.append(f"{datetime.now():%H:%M:%S} ENTRY {direction} SPREAD lots={lots} "
+                              f"net_debit={net_debit:.1f}")
 
     def _execute_expiry(self, spot, expiry_date):
         """Expiry-day max-pain reversion, using the live Kite chain (not NSE)."""
@@ -581,6 +607,78 @@ class LivePaperTrader:
 
         logging.info(f"EXECUTED EXPIRY-DAY MAX-PAIN TRADE: {lots} lots of {tsym} at {entry_prem} "
                     f"(spot {spot:.0f}, max pain {pain:.0f}).")
+        self.trade_log.append(f"{datetime.now():%H:%M:%S} ENTRY EXPIRY {tsym} qty={qty} @ Rs{entry_prem:.1f}")
+
+    def _dashboard_update(self, state):
+        """Pulls current system state into the Dashboard's expected shape.
+        Called from a background thread, roughly every `refresh` seconds."""
+        state["status"] = (f"{self.current_regime} | "
+                           f"{'HALTED' if self.risk_manager.halted else 'LIVE'} | "
+                           f"overnight x{self.overnight_risk_multiplier:.1f} | "
+                           f"flipper_guard={'ARMED' if self.allow_flipper else 'DISARMED'}")
+        state["day_pnl"] = self.risk_manager.day_pnl
+        state["kill_limit"] = -self.risk_manager.current_dynamic_max_loss
+        state["profit_lock"] = self.risk_manager.daily_profit_target
+        state["signals"] = self.premarket_signals
+        state["latency_ms"] = (time.time() - self.last_tick_time) * 1000 if self.latest_spot else 0.0
+
+        # Sentiment panel: real headlines, tagged with the aggregate score —
+        # SentimentEnsemble only returns one combined score, not per-headline,
+        # so every row intentionally shows the same number.
+        state["sentiment"] = [(h, self.sent_score) for h in self.last_headlines[:5]]
+
+        # Macro panel: overnight % moves already computed in build_signals()
+        if self.today_row is not None:
+            macro_cols = ["sp500_chg", "nasdaq_chg", "nikkei_chg", "kospi_chg",
+                         "brent_chg", "dxy_chg", "us10y_chg", "usdinr_chg", "banknifty_chg"]
+            state["macro"] = {c.replace("_chg", ""): {"last": "-", "chg_pct": getattr(self.today_row, c, 0.0)}
+                              for c in macro_cols if hasattr(self.today_row, c)}
+
+        state["chain"] = {
+            "spot": self.latest_spot or "-",
+            "pcr": f"{self.last_pcr:.2f}" if self.last_pcr is not None else "-",
+            "max_pain": self.last_max_pain if self.last_max_pain is not None else "-",
+            "ceiling": self.last_call_wall if self.last_call_wall is not None else "-",
+            "floor": self.last_put_wall if self.last_put_wall is not None else "-",
+            "vix": self.today_row.vix if self.today_row is not None else "-",
+            "gex": "-",  # gamma exposure not currently computed live — see options_math.gamma_exposure if needed
+        }
+
+        # Positions: naked Position already matches Dashboard's expected shape.
+        # MultiLegPosition doesn't (different fields), so adapt it with a
+        # lightweight shim rather than changing Dashboard's render() contract.
+        positions = []
+        if self.active_position:
+            positions.append(self.active_position)
+        if self.active_multi_position:
+            pos = self.active_multi_position
+            leg_desc = "/".join(f"{l['side'][0]}{l['symbol'].split(':')[-1][-9:]}" for l in pos.legs)
+            shim = type("DisplayPosition", (), {})()
+            shim.symbol = f"{pos.kind}[{leg_desc}]"
+            shim.qty = pos.qty
+            shim.entry = pos.entry_net_cash / pos.qty if pos.qty else 0.0
+            shim.stop = -pos.max_loss_per_unit
+            shim.target = pos.max_loss_per_unit * 0.5
+            positions.append(shim)
+        state["positions"] = positions
+        state["trades"] = self.trade_log
+
+    def _start_dashboard(self, refresh=20.0):
+        """Prints a full-state snapshot every `refresh` seconds from a
+        background thread. Deliberately NOT a persistent Live-updating pane —
+        that would fight with normal logging.info() calls from other threads
+        for terminal ownership. A periodic snapshot coexists cleanly with
+        the regular event log instead."""
+        def loop():
+            while not self._intentional_close:
+                try:
+                    self._dashboard_update(self.dashboard.state)
+                    self.dashboard.snapshot()
+                except Exception as e:
+                    logging.warning(f"Dashboard render failed ({e})")
+                time.sleep(refresh)
+        self._dashboard_thread = threading.Thread(target=loop, daemon=True)
+        self._dashboard_thread.start()
 
     def _start_watchdog(self):
         """Runs independently of ticks so EOD squareoff fires even if the feed
@@ -620,6 +718,7 @@ class LivePaperTrader:
         self.ticker = KiteTicker(self.adapter.api_key, self.kite.access_token)
 
         def on_ticks(ws, ticks):
+            self.last_tick_time = time.time()
             for tick in ticks:
                 token = tick['instrument_token']
                 ltp = tick['last_price']
@@ -703,12 +802,16 @@ class LivePaperTrader:
                 logging.info(f"PARTIAL PROFIT BOOKED: {exit_qty} qty @ {current_prem}. "
                             f"Realized: Rs {pnl:.2f}. Remaining qty {self.active_position.qty} "
                             f"now stopped at breakeven ({self.active_position.stop:.2f}).")
+                self.trade_log.append(f"{datetime.now():%H:%M:%S} PARTIAL EXIT {exit_qty}qty @ Rs{current_prem:.1f} "
+                                      f"PnL={pnl:+.1f}")
             return
 
         if action in ["FULL_EXIT", "STOP_LOSS", "DISASTER_STOP", "EOD_SQUAREOFF"]:
             logging.info(f"TRAILING STOP TRIGGERED ({action}). Current price: {current_prem}. Closing position.")
             pnl = self.broker.close(self.active_position, current_prem)
             logging.info(f"Position Closed. Realized PnL: Rs {pnl:.2f}. New Capital: Rs {self.broker.capital:.2f}")
+            self.trade_log.append(f"{datetime.now():%H:%M:%S} EXIT ({action}) PnL={pnl:+.1f} "
+                                  f"Capital=Rs{self.broker.capital:.0f}")
             self.active_position = None
 
             self.risk_manager.register_pnl(pnl)
@@ -755,6 +858,8 @@ class LivePaperTrader:
             pnl = self.broker.close_multi(pos, exit_prices)
             logging.info(f"MULTI-LEG EXIT ({reason}, {pos.kind}): Realized PnL Rs {pnl:.2f}. "
                         f"New capital Rs {self.broker.capital:.2f}")
+            self.trade_log.append(f"{datetime.now():%H:%M:%S} EXIT {pos.kind} ({reason}) PnL={pnl:+.1f} "
+                                  f"Capital=Rs{self.broker.capital:.0f}")
             self.active_multi_position = None
             self.leg_tokens = {}
 
@@ -781,6 +886,8 @@ def main():
         # regardless, so we still try to trade rather than exiting outright.
         logging.info("Premarket bias is NO_TRADE, but regime/expiry-day strategies "
                      "will still be evaluated after market open.")
+
+    trader._start_dashboard(refresh=20.0)  # periodic full-state snapshot for the rest of the session
 
     spot = trader.wait_for_market_open()
     trader.execute_paper_trade(plan, spot)
