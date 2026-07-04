@@ -29,7 +29,7 @@ from ..execution.paper_broker import PaperBroker
 
 FACTOR_TICKERS = {
     "sp500": "^GSPC", "nasdaq": "^IXIC", "brent": "BZ=F", "usdinr": "USDINR=X", "dxy": "DX-Y.NYB",
-    "us10y": "^TNX", "nikkei": "^N225", "banknifty": "^NSEBANK",
+    "us10y": "^TNX", "nikkei": "^N225", "kospi": "^KS11", "banknifty": "^NSEBANK",
     "adr_infy": "INFY", "adr_hdb": "HDB", "adr_ibn": "IBN",
     "hw_rel": "RELIANCE.NS", "hw_hdfc": "HDFCBANK.NS", "hw_icici": "ICICIBANK.NS",
     "hw_infy": "INFY.NS", "hw_tcs": "TCS.NS",
@@ -46,10 +46,33 @@ def load_history(years=20):
     vix.columns = [c[0] if isinstance(c, tuple) else c for c in vix.columns]
     df = nifty[["Open", "High", "Low", "Close"]].copy()
     df["vix"] = vix["Close"].reindex(df.index).ffill().fillna(15.0)
-    df["sma20"] = df["Close"].rolling(20).mean()
-    df["sma50"] = df["Close"].rolling(50).mean()
+
+    # Simple moving averages: 10/20/50/100/200 DMA (20/50 already existed)
+    for p in (10, 20, 50, 100, 200):
+        df[f"sma{p}"] = df["Close"].rolling(p).mean()
     df["dma20"] = df["sma20"]  # Alias for strategy access
     df["dma50"] = df["sma50"]
+
+    # Exponential moving averages: 10/20/50/100/200
+    for p in (10, 20, 50, 100, 200):
+        df[f"ema{p}"] = df["Close"].ewm(span=p, adjust=False).mean()
+
+    # Bollinger Bands (20, 2 std) + %B (0 = at lower band, 1 = at upper band)
+    bb_mid = df["Close"].rolling(20).mean()
+    bb_std = df["Close"].rolling(20).std()
+    df["bb_mid"] = bb_mid
+    df["bb_upper"] = bb_mid + 2 * bb_std
+    df["bb_lower"] = bb_mid - 2 * bb_std
+    bb_width = (df["bb_upper"] - df["bb_lower"]).replace(0, 1e-9)
+    df["bb_pctb"] = (df["Close"] - df["bb_lower"]) / bb_width
+
+    # Stochastic Oscillator (14, 3): %K then %D as a 3-day SMA of %K
+    low14 = df["Low"].rolling(14).min()
+    high14 = df["High"].rolling(14).max()
+    stoch_range = (high14 - low14).replace(0, 1e-9)
+    df["stoch_k"] = 100 * (df["Close"] - low14) / stoch_range
+    df["stoch_d"] = df["stoch_k"].rolling(3).mean()
+
     # Approximate VWAP on daily bars using typical price
     df["vwap"] = (((df["High"] + df["Low"] + df["Close"]) / 3) * df["Close"]).rolling(14).sum() / df["Close"].rolling(14).sum()
     df["atr"] = (df["High"] - df["Low"]).rolling(14).mean()
@@ -78,8 +101,9 @@ def load_history(years=20):
                        progress=False, group_by="ticker", auto_adjust=True)
     for name, tkr in FACTOR_TICKERS.items():
         try:
-            if name == "nikkei":
-                # Nikkei opens before Nifty. Gap from Nikkei yesterday close to today open is better
+            if name in ("nikkei", "kospi"):
+                # Asian markets open before Nifty. Gap from their yesterday close to
+                # today's open is a better lookahead-safe signal than same-day close.
                 chg = (data[tkr]["Open"] / data[tkr]["Close"].shift(1) - 1).dropna() * 100
                 df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").fillna(0.0)
             else:
@@ -89,7 +113,7 @@ def load_history(years=20):
             df[f"{name}_chg"] = 0.0
 
     # After all downloads, fill any remaining NaN columns (handles 403 errors on yfinance)
-    for col in ['sp500_chg','nasdaq_chg','nikkei_chg','brent_chg',
+    for col in ['sp500_chg','nasdaq_chg','nikkei_chg','kospi_chg','brent_chg',
                 'dxy_chg','us10y_chg','usdinr_chg','banknifty_chg',
                 'hw_breadth','adr_chg'] + HW_COLS + ADR_COLS:
         if col not in df.columns:
@@ -101,8 +125,14 @@ def load_history(years=20):
     # ADR composite: average prev-day move of Indian ADRs in the US session
     df["adr_chg"] = sum(df[c] for c in ADR_COLS) / len(ADR_COLS)
 
-    # Mocking FII flow for historical backtest using ADR moves proxy (better than zeros)
-    # In live mode this is pulled from NSE API.
+    # FII/DII net flow: Zerodha's Kite API does not expose FII/DII provisional
+    # flow data (it's an NSE/exchange bulletin, not a broker-quote field), and
+    # per instruction this system does not scrape the NSE website. So this
+    # stays a proxy (ADR overnight move as a stand-in for FII sentiment) in
+    # BOTH backtest and live mode — it is NOT real FII/DII data. If you get
+    # access to a paid data vendor that carries this feed, replace this line
+    # with a real fetch; there is no free, Kite-native, non-NSE-scraping source
+    # for it today.
     df["fii_net_cr"] = df["adr_chg"] * 2500.0
 
     return df.dropna()
@@ -134,9 +164,11 @@ def _clip(x):
 def build_signals(prev, today, prev2_close, prev3_close=None) -> list:
     """All factor signals for one day. Used by backtest AND auditable by verify_data.py."""
     gap_pct = (today.Open / prev.Close - 1) * 100
+    kospi_chg = today.kospi_chg if hasattr(today, "kospi_chg") else 0.0
     macro_raw = (0.25 * today.sp500_chg + 0.25 * today.nasdaq_chg + 0.15 * today.nikkei_chg
+                 + 0.05 * kospi_chg
                  - 0.10 * today.brent_chg - 0.15 * today.dxy_chg - 0.10 * today.us10y_chg
-                 - 3.0 * 0.25 * today.usdinr_chg) / 1.2
+                 - 3.0 * 0.25 * today.usdinr_chg) / 1.25
 
     # 3-day smoothed momentum (more stable, avoids expiry whipsaw distortions)
     if prev3_close is not None:
@@ -175,12 +207,26 @@ def build_signals(prev, today, prev2_close, prev3_close=None) -> list:
     rsi_conf  = 0.60 if abs(rsi14 - 50) > 10 else 0.40
     signals.append(SignalScore("rsi14", rsi_score, rsi_conf))
 
-    from ..signals.engine import iv_skew_signal, max_pain_signal, crude_signal, fii_flow_signal
+    from ..signals.engine import (iv_skew_signal, max_pain_signal, crude_signal, fii_flow_signal,
+                                   bollinger_signal, stochastic_signal, ma_trend_signal)
+
+    # Bollinger Bands (20, 2 std) — contrarian mean-reversion read
+    if hasattr(today, "bb_pctb") and today.bb_pctb == today.bb_pctb:  # NaN-safe check
+        signals.append(bollinger_signal(today.bb_pctb))
+
+    # Stochastic Oscillator (14,3)
+    if hasattr(today, "stoch_k") and hasattr(today, "stoch_d") and today.stoch_k == today.stoch_k:
+        signals.append(stochastic_signal(today.stoch_k, today.stoch_d))
+
+    # Multi-DMA/EMA trend stack: price vs 20/50/200 SMA alignment
+    if all(hasattr(today, c) for c in ("sma20", "sma50", "sma200")) and today.sma200 == today.sma200:
+        signals.append(ma_trend_signal(today.Close, today.sma20, today.sma50, today.sma200))
 
     # Add Crude Regime Signal
     signals.append(crude_signal(brent_price=80.0, brent_chg_pct=today.brent_chg)) # using 80.0 as mock baseline for backtest where price isn't available
 
-    # Add FII flow signal
+    # Add FII flow signal — see load_history() for why this is an ADR-based
+    # proxy rather than real FII/DII data in both backtest AND live mode.
     if hasattr(today, "fii_net_cr"):
         signals.append(fii_flow_signal(today.fii_net_cr, 0.0))
     else:
