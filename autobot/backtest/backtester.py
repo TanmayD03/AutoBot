@@ -48,18 +48,22 @@ def load_history(years=20):
     df["vix"] = vix["Close"].reindex(df.index).ffill().fillna(15.0)
 
     # Simple moving averages: 10/20/50/100/200 DMA (20/50 already existed)
+    # min_periods=1 so a short live-mode window (load_history(1) ≈ 250 rows)
+    # doesn't get wiped out by dropna() below waiting for a full 200-row window —
+    # early values are just less statistically robust, not NaN.
     for p in (10, 20, 50, 100, 200):
-        df[f"sma{p}"] = df["Close"].rolling(p).mean()
+        df[f"sma{p}"] = df["Close"].rolling(p, min_periods=1).mean()
     df["dma20"] = df["sma20"]  # Alias for strategy access
     df["dma50"] = df["sma50"]
 
-    # Exponential moving averages: 10/20/50/100/200
+    # Exponential moving averages: 10/20/50/100/200 (ewm never produces NaN
+    # from insufficient history the way rolling() does, so no change needed)
     for p in (10, 20, 50, 100, 200):
         df[f"ema{p}"] = df["Close"].ewm(span=p, adjust=False).mean()
 
     # Bollinger Bands (20, 2 std) + %B (0 = at lower band, 1 = at upper band)
-    bb_mid = df["Close"].rolling(20).mean()
-    bb_std = df["Close"].rolling(20).std()
+    bb_mid = df["Close"].rolling(20, min_periods=2).mean()
+    bb_std = df["Close"].rolling(20, min_periods=2).std()
     df["bb_mid"] = bb_mid
     df["bb_upper"] = bb_mid + 2 * bb_std
     df["bb_lower"] = bb_mid - 2 * bb_std
@@ -67,21 +71,28 @@ def load_history(years=20):
     df["bb_pctb"] = (df["Close"] - df["bb_lower"]) / bb_width
 
     # Stochastic Oscillator (14, 3): %K then %D as a 3-day SMA of %K
-    low14 = df["Low"].rolling(14).min()
-    high14 = df["High"].rolling(14).max()
+    low14 = df["Low"].rolling(14, min_periods=1).min()
+    high14 = df["High"].rolling(14, min_periods=1).max()
     stoch_range = (high14 - low14).replace(0, 1e-9)
     df["stoch_k"] = 100 * (df["Close"] - low14) / stoch_range
-    df["stoch_d"] = df["stoch_k"].rolling(3).mean()
+    df["stoch_d"] = df["stoch_k"].rolling(3, min_periods=1).mean()
 
     # Approximate VWAP on daily bars using typical price
-    df["vwap"] = (((df["High"] + df["Low"] + df["Close"]) / 3) * df["Close"]).rolling(14).sum() / df["Close"].rolling(14).sum()
-    df["atr"] = (df["High"] - df["Low"]).rolling(14).mean()
-    df["vix_pct_rank"] = df["vix"].rolling(252).rank(pct=True) * 100
+    df["vwap"] = (((df["High"] + df["Low"] + df["Close"]) / 3) * df["Close"]).rolling(14, min_periods=1).sum() \
+                 / df["Close"].rolling(14, min_periods=1).sum()
+    df["atr"] = (df["High"] - df["Low"]).rolling(14, min_periods=1).mean()
+    # min_periods=30: a genuine percentile rank needs SOME history to mean
+    # anything, but the original min_periods=252 (implicit default) made this
+    # the single biggest cause of a near-empty dataframe on load_history(1) —
+    # a "1 year" yfinance download (~250 trading days) can end up with FEWER
+    # than 252 rows total, so a full-window requirement produced zero valid
+    # rows, and dropna() wiped out virtually the whole live pre-market dataset.
+    df["vix_pct_rank"] = df["vix"].rolling(252, min_periods=30).rank(pct=True) * 100
     # Calculate basic ADX(14) and RSI(14)
     import pandas as pd
     delta = df["Close"].diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    gain  = delta.clip(lower=0).rolling(14, min_periods=1).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14, min_periods=1).mean()
     df["rsi14"] = 100 - (100 / (1 + gain / loss.replace(0, 1e-9)))
 
     high_low = df["High"] - df["Low"]
@@ -90,10 +101,10 @@ def load_history(years=20):
     tr = pd.concat([high_low, high_pc, low_pc], axis=1).max(axis=1)
     plus_dm  = (df["High"].diff()).clip(lower=0)
     minus_dm = (-df["Low"].diff()).clip(lower=0)
-    plus_di  = 100 * plus_dm.rolling(14).mean()  / tr.rolling(14).mean()
-    minus_di = 100 * minus_dm.rolling(14).mean() / tr.rolling(14).mean()
+    plus_di  = 100 * plus_dm.rolling(14, min_periods=1).mean()  / tr.rolling(14, min_periods=1).mean()
+    minus_di = 100 * minus_dm.rolling(14, min_periods=1).mean() / tr.rolling(14, min_periods=1).mean()
     dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9))
-    df["adx"] = dx.rolling(14).mean()
+    df["adx"] = dx.rolling(14, min_periods=1).mean()
     df["adx"] = df["adx"].fillna(15.0) # default fallback
 
     # Batch-download all factor tickers; shift(1) alignment = no lookahead.
