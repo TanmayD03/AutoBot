@@ -16,6 +16,17 @@ class Position:
 
 
 @dataclass
+class MultiLegPosition:
+    """A spread or iron condor: multiple legs treated as one risk unit.
+    legs: list of {"symbol", "side" ("BUY"/"SELL"), "entry", "qty"}."""
+    legs: list
+    max_loss_per_unit: float
+    qty: int
+    kind: str            # e.g. "DEBIT_SPREAD", "CREDIT_CONDOR"
+    entry_net_cash: float  # cash flow at entry (positive=credit received, negative=debit paid)
+
+
+@dataclass
 class Fill:
     symbol: str
     qty: int
@@ -89,4 +100,59 @@ class PaperBroker:
         pos.qty -= qty
         if pos.qty <= 0:
             self.positions.remove(pos)
+        return pnl
+
+    def buy_multi(self, legs, max_loss_per_unit, qty, kind="DEBIT_SPREAD"):
+        """
+        Open a multi-leg position (spread or iron condor).
+        legs: list of {"symbol": str, "side": "BUY"/"SELL", "price": float}
+
+        Risk-checked against max_loss_per_unit * qty — the TRUE worst case —
+        not the net premium. A credit spread's cash inflow at entry is not
+        its risk; a bug that inverted this would look "free" until assigned.
+        """
+        worst_case_risk = max_loss_per_unit * qty
+        if worst_case_risk > self.capital * 0.60:
+            return None  # same circuit breaker spirit as buy()
+
+        total_flow = 0.0
+        total_charges = 0.0
+        built_legs = []
+        for leg in legs:
+            side = leg["side"]
+            px = leg["price"] * (1 + self.SLIPPAGE_PCT) if side == "BUY" else leg["price"] * (1 - self.SLIPPAGE_PCT)
+            turnover = px * qty
+            ch = self.charges(turnover, sell_side=(side == "SELL"))
+            total_charges += ch
+            total_flow += (-turnover if side == "BUY" else turnover)
+            built_legs.append({"symbol": leg["symbol"], "side": side, "entry": px, "qty": qty})
+            self.fills.append(Fill(leg["symbol"], qty, px, side, ch))
+
+        net_cash = total_flow - total_charges
+        if -net_cash > self.capital * 0.95:  # a net-debit spread costing more than we have
+            return None
+
+        self.capital += net_cash  # credit adds to capital, debit subtracts
+        pos = MultiLegPosition(legs=built_legs, max_loss_per_unit=max_loss_per_unit,
+                                qty=qty, kind=kind, entry_net_cash=net_cash)
+        self.positions.append(pos)
+        return pos
+
+    def close_multi(self, pos: MultiLegPosition, exit_prices: dict):
+        """exit_prices: {symbol: current_price} for every leg. Unwinds each
+        leg (a BUY leg is sold to close, a SELL leg is bought back)."""
+        total_flow = 0.0
+        for leg in pos.legs:
+            price = exit_prices.get(leg["symbol"], leg["entry"])
+            closing_side = "SELL" if leg["side"] == "BUY" else "BUY"
+            px = price * (1 - self.SLIPPAGE_PCT) if closing_side == "SELL" else price * (1 + self.SLIPPAGE_PCT)
+            turnover = px * pos.qty
+            ch = self.charges(turnover, sell_side=(closing_side == "SELL"))
+            total_flow += (turnover if closing_side == "SELL" else -turnover) - ch
+            self.fills.append(Fill(leg["symbol"], pos.qty, px, closing_side, ch))
+
+        self.capital += total_flow
+        pnl = pos.entry_net_cash + total_flow
+        self.realized_pnl += pnl
+        self.positions.remove(pos)
         return pnl
