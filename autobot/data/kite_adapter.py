@@ -68,3 +68,65 @@ class KiteAdapter:
             "instrument_token": int(row["instrument_token"]),
             "lot_size": int(row["lot_size"])
         }
+
+    def get_option_chain(self, expiry_date: datetime.date, spot: float,
+                          strike_range_count: int = 15, strike_step: int = 50) -> list:
+        """
+        Builds an option-chain snapshot directly from Zerodha Kite — batches
+        kite.quote() across the strikes around spot to pull OI and LTP per
+        strike. No NSE website scraping involved.
+
+        Returns a list of dicts: {strike, call_oi, put_oi, call_ltp, put_ltp}
+        — the schema autobot.options_math.black_scholes (max_pain,
+        put_call_ratio, get_option_walls) and signals.engine (oi_walls_signal
+        etc.) already expect.
+        """
+        if self.instruments_df is None:
+            self.fetch_master_instruments()
+
+        df = self.instruments_df
+        opts = df[(df['name'] == 'NIFTY') & (df['segment'] == 'NFO-OPT')].copy()
+        opts['expiry_date'] = pd.to_datetime(opts['expiry']).dt.date
+        opts = opts[opts['expiry_date'] == expiry_date]
+
+        atm = round(spot / strike_step) * strike_step
+        lo = atm - strike_range_count * strike_step
+        hi = atm + strike_range_count * strike_step
+        opts = opts[(opts['strike'] >= lo) & (opts['strike'] <= hi)]
+
+        if opts.empty:
+            logging.warning(f"get_option_chain: no NIFTY strikes found for expiry {expiry_date} "
+                            f"in range [{lo}, {hi}]")
+            return []
+
+        symbols = [f"NFO:{ts}" for ts in opts['tradingsymbol'].tolist()]
+
+        # Kite's quote() accepts a batch of instruments, but we chunk
+        # conservatively to stay well under any per-request instrument limit.
+        quotes = {}
+        CHUNK = 200
+        for i in range(0, len(symbols), CHUNK):
+            batch = symbols[i:i + CHUNK]
+            try:
+                quotes.update(self.kite.quote(batch))
+            except Exception as e:
+                logging.warning(f"get_option_chain: quote() batch failed ({e}); "
+                                f"continuing with strikes fetched so far.")
+
+        chain = {}
+        for _, row in opts.iterrows():
+            tsym = f"NFO:{row['tradingsymbol']}"
+            q = quotes.get(tsym)
+            if not q:
+                continue
+            strike = float(row['strike'])
+            entry = chain.setdefault(strike, {"strike": strike, "call_oi": 0, "put_oi": 0,
+                                                "call_ltp": 0.0, "put_ltp": 0.0})
+            if row['instrument_type'] == 'CE':
+                entry["call_oi"] = q.get("oi", 0)
+                entry["call_ltp"] = q.get("last_price", 0.0)
+            else:
+                entry["put_oi"] = q.get("oi", 0)
+                entry["put_ltp"] = q.get("last_price", 0.0)
+
+        return sorted(chain.values(), key=lambda c: c["strike"])
