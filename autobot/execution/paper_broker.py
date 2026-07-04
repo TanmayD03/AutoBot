@@ -71,3 +71,22 @@ class PaperBroker:
         self.fills.append(Fill(pos.symbol, pos.qty, px, "SELL", ch))
         self.positions.remove(pos)
         return pnl
+
+    def close_partial(self, pos: Position, qty: int, price):
+        """Close part of a position (scale-out). Reduces pos.qty in place and
+        returns the realized PnL on just the closed portion. The position stays
+        open (in self.positions) with the remaining qty."""
+        qty = min(qty, pos.qty)
+        if qty <= 0:
+            return 0.0
+        px = price * (1 - self.SLIPPAGE_PCT)
+        proceeds = px * qty
+        ch = self.charges(proceeds, sell_side=True)
+        self.capital += proceeds - ch
+        pnl = (px - pos.entry) * qty - ch
+        self.realized_pnl += pnl
+        self.fills.append(Fill(pos.symbol, qty, px, "SELL", ch))
+        pos.qty -= qty
+        if pos.qty <= 0:
+            self.positions.remove(pos)
+        return pnl
