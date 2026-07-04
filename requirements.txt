@@ -12,3 +12,11 @@ pytest>=7.0
 # neo-api-client  # Kotak Neo official SDK (live mode only)
 kiteconnect>=5.0.1
 python-dotenv>=1.0.0
+
+# Optional — GIFT Nifty (NSE IX) live tracking via TradingView's guest feed.
+# PyPI release lags behind; install from GitHub directly:
+#   pip install --upgrade --no-cache-dir git+https://github.com/rongardF/tvdatafeed.git
+# System runs fine without it — GiftNiftyTracker degrades gracefully and
+# falls back to the NSE marketStatus endpoint (which itself is unreliable
+# for GIFT Nifty specifically — see autobot/data/market_feed.py docstring).
+tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git
