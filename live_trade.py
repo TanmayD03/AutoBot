@@ -15,7 +15,8 @@ from autobot.strategy.capital import CapitalManager
 from autobot.strategy.trail import TrailManager
 from autobot.strategy.risk import RiskManager
 from autobot.sentiment.ensemble import SentimentEnsemble
-from autobot.options_math.black_scholes import implied_vol, greeks
+from autobot.options_math.black_scholes import implied_vol, greeks, max_pain, put_call_ratio
+from autobot.signals.engine import pcr_signal, max_pain_signal, oi_walls_signal, iv_skew_signal
 from autobot.execution.paper_broker import PaperBroker
 
 from kiteconnect import KiteTicker
@@ -83,6 +84,8 @@ class LivePaperTrader:
 
         self.sentiment = SentimentEnsemble()
         self.current_regime = "TRENDING"  # updated by run_premarket_analysis each session
+        self.premarket_signals = []
+        self.sent_score = 0.0
 
         # Reconnect / shutdown state for the websocket
         self._intentional_close = False
@@ -133,6 +136,12 @@ class LivePaperTrader:
         # The actual 'spot' price isn't fully known until 09:15 open, but we use prev close to build the plan direction
         plan = self.decision_engine.decide(signals, prev.Close, sentiment_impact=sent_score)
 
+        # Stashed for post-open refinement in execute_paper_trade — PCR/max-pain/
+        # OI-walls/IV-skew need a real live spot and can only be computed after
+        # market open, so this pre-market plan is a coarse bias, not the final say.
+        self.premarket_signals = signals
+        self.sent_score = sent_score
+
         if plan is None or plan.action == "NO_TRADE":
             logging.warning("Pre-market analysis dictates NO TRADE for today.")
             return None
@@ -154,12 +163,60 @@ class LivePaperTrader:
                     return spot
             time.sleep(2)
 
+    def refine_plan_with_option_chain(self, spot, expiry_date):
+        """
+        Refines the pre-market plan using a LIVE option-chain snapshot built
+        entirely from Zerodha Kite's own quote() API (see
+        KiteAdapter.get_option_chain) — no NSE website scraping. PCR,
+        max-pain, OI walls, and ATM IV skew all need a real spot price, which
+        only exists after market open, so this step happens here rather than
+        in run_premarket_analysis.
+        """
+        extra_signals = list(self.premarket_signals)
+        try:
+            chain = self.adapter.get_option_chain(expiry_date, spot)
+            if chain:
+                pcr = put_call_ratio(chain)
+                pain = max_pain(chain)
+                extra_signals.append(pcr_signal(pcr))
+                extra_signals.append(max_pain_signal(spot, pain))
+                extra_signals.append(oi_walls_signal(chain, spot))
+
+                atm_strike = round(spot / 50) * 50
+                atm_row = min(chain, key=lambda c: abs(c["strike"] - atm_strike))
+                t = days_to_nifty_expiry(datetime.now())
+                if atm_row["call_ltp"] > 0 and atm_row["put_ltp"] > 0 and t > 0:
+                    iv_ce = implied_vol(atm_row["call_ltp"], spot, atm_row["strike"], r=0.068, t=t, kind="C")
+                    iv_pe = implied_vol(atm_row["put_ltp"], spot, atm_row["strike"], r=0.068, t=t, kind="P")
+                    extra_signals.append(iv_skew_signal(iv_pe, iv_ce))
+
+                logging.info(f"Live Kite option chain: PCR={pcr:.2f} MaxPain={pain:.0f} "
+                            f"({len(chain)} strikes from {expiry_date})")
+            else:
+                logging.warning("Live option chain came back empty; proceeding on macro+sentiment signals only.")
+        except Exception as e:
+            logging.warning(f"Option chain fetch/merge failed ({e}); proceeding on macro+sentiment signals only.")
+
+        refined = self.decision_engine.decide(extra_signals, spot, sentiment_impact=self.sent_score)
+        logging.info(f"REFINED PLAN (post-open, live option chain): {refined.action} "
+                    f"(confidence {refined.confidence:.2f}) — {refined.reason}")
+        return refined
+
     def execute_paper_trade(self, plan, spot):
         """Map the plan to a specific option, size it, and buy via PaperBroker."""
-        atm = round(spot / 50) * 50
-        kind = "CE" if plan.action == "BUY_CE" else "PE"
         today_date = datetime.now().date()
         expiry_date = get_next_tuesday(today_date)
+
+        # Refine using a live spot + live Kite option chain — the pre-market
+        # plan was only a coarse macro/sentiment bias since PCR/max-pain/OI
+        # walls/IV skew can't be known before 09:15.
+        plan = self.refine_plan_with_option_chain(spot, expiry_date)
+        if plan is None or plan.action == "NO_TRADE":
+            logging.warning(f"Post-open refinement is NO_TRADE ({plan.reason if plan else 'n/a'}). Skipping trade.")
+            return
+
+        atm = round(spot / 50) * 50
+        kind = "CE" if plan.action == "BUY_CE" else "PE"
 
         logging.info(f"Resolving instrument for NIFTY {atm} {kind} exp {expiry_date}...")
         try:
