@@ -151,7 +151,7 @@ class LivePaperTrader:
     def run_premarket_analysis(self) -> dict:
         """Download history and decide direction before market opens (based on overnight macro)."""
         logging.info("Downloading historical macro data to build pre-market signals...")
-        df = load_history(1)  # Load 1 year
+        df = load_history(2)  # Load 2 years — extra headroom on top of the min_periods fix below
 
         if len(df) < 4:
             logging.error("Not enough historical data to generate signals.")
