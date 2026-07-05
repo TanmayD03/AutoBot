@@ -204,7 +204,15 @@ class LivePaperTrader:
         regime = self.regime_detector.classify(vix=today.vix, adx=adx_val, atr_pct=(today.atr / prev.Close) * 100)
         self.current_regime = regime  # stashed for regime-aware sizing/strategy selection
 
-        logging.info(f"Regime Detected: {regime}")
+        # DecisionEngine was hardcoded to its class default (0.70) regardless
+        # of regime — config.yaml has had per-regime confidence_threshold
+        # values (0.55 choppy / 0.58 trending / 0.65 high_vol) that were never
+        # actually read here. Found this while building an intraday replay
+        # harness against real Kite data — same class of bug as the sizing
+        # gap fixed a few messages ago (config.yaml as decoration, not a
+        # real control surface).
+        self.decision_engine.threshold = self._regime_config(regime).get("confidence_threshold", 0.70)
+        logging.info(f"Regime Detected: {regime} (confidence gate: {self.decision_engine.threshold})")
 
         # --- Live FII/DII + ADR pre-flight matrix (NSE FII/DII, direct Yahoo ADR JSON) ---
         # Replaces the historical ADR-based proxy build_signals() uses for both
