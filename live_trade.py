@@ -18,6 +18,7 @@ def now_ist() -> datetime:
 
 
 import pandas as pd
+import yaml
 from autobot.data.kite_adapter import KiteAdapter
 from autobot.backtest.backtester import load_history, build_signals, days_to_nifty_expiry
 from autobot.strategy.decision import DecisionEngine
@@ -106,13 +107,29 @@ class LivePaperTrader:
         self.latest_leg_prices = {}   # "NFO:tradingsymbol" -> last price
         self.ticker = None
 
+        # Load config.yaml for real — previously ONLY the backtester read this
+        # file; live_trade.py had its own hardcoded values entirely
+        # disconnected from it, including CapitalManager's default 50%
+        # max_risk_per_trade_pct (vs config.yaml's 1.5-2.0% per-regime values).
+        # Editing config.yaml used to have zero effect on live trading.
+        try:
+            with open("config.yaml", "r") as f:
+                self.config = yaml.safe_load(f)
+        except Exception as e:
+            logging.warning(f"config.yaml not found/unreadable ({e}); using built-in defaults.")
+            self.config = {}
+
+        risk_cfg = self.config.get("risk", {})
+        squareoff_str = risk_cfg.get("squareoff_time", "15:15")
+        squareoff_h, squareoff_m = (int(x) for x in squareoff_str.split(":"))
+
         # Risk manager: daily kill switch, profit lock, R:R gate, EOD squareoff time.
         self.risk_manager = RiskManager(
-            daily_profit_target=self.broker.capital * 0.02,   # lock in day at +2%
-            daily_max_loss=self.broker.capital * 0.01,        # kill switch at -1%
-            reward_risk_min=2.5,
-            max_open_positions=1,
-            squareoff=dtime(15, 15),
+            daily_profit_target=self.broker.capital * risk_cfg.get("daily_profit_target_pct", 2.5) / 100.0,
+            daily_max_loss=self.broker.capital * risk_cfg.get("daily_max_loss_pct", 3.0) / 100.0,
+            reward_risk_min=risk_cfg.get("reward_risk_min", 2.5),
+            max_open_positions=risk_cfg.get("max_open_positions", 1),
+            squareoff=dtime(squareoff_h, squareoff_m),
         )
         self.risk_manager.new_day()
 
@@ -358,6 +375,15 @@ class LivePaperTrader:
                     f"(confidence {refined.confidence:.2f}) — {refined.reason}")
         return refined
 
+    def _regime_config(self, regime=None):
+        """Returns config.yaml's per-regime block (risk_per_trade_pct,
+        theta_timeout_minutes, etc.) — falls back to an empty dict (which
+        makes callers fall back to their own hardcoded defaults) if
+        config.yaml is missing or the regime key isn't present."""
+        regime = regime or self.current_regime
+        key = regime.lower()
+        return self.config.get("regimes", {}).get(key, {})
+
     def _get_live_vix(self):
         """Live India VIX quote — used on intraday re-checks so the condor
         viability test reflects current volatility, not the premarket value
@@ -454,7 +480,8 @@ class LivePaperTrader:
             logging.warning(f"IV/delta solve failed ({e}); falling back to ATM delta=0.5")
             delta = 0.5 if opt_kind == "C" else -0.5
 
-        risk_pct = self.capital_manager.regime_confidence_risk_pct(self.current_regime, plan.confidence) \
+        base_pct = self._regime_config().get("risk_per_trade_pct", 2.0) / 100.0
+        risk_pct = self.capital_manager.regime_confidence_risk_pct(self.current_regime, plan.confidence, base_pct=base_pct) \
             * self.overnight_risk_multiplier
         lots = self.capital_manager.calculate_lots_by_delta(
             self.broker.capital, entry_prem, delta,
@@ -467,6 +494,8 @@ class LivePaperTrader:
         qty = lots * leg["lot_size"]
         disaster = max(1.0, entry_prem * 0.5)
         self.active_position = self.broker.buy(tsym, qty, entry_prem, stop=disaster, target=entry_prem * 3)
+        if self.active_position:
+            self.active_position.entry_time = now_ist()
         if not self.active_position:
             logging.warning("Broker rejected naked entry (capital circuit breaker).")
             return
@@ -515,7 +544,8 @@ class LivePaperTrader:
             return False
 
         lot_size = ce_short["lot_size"]
-        risk_pct = self.capital_manager.regime_confidence_risk_pct("CHOPPY", 0.70) * self.overnight_risk_multiplier
+        base_pct = self._regime_config("CHOPPY").get("risk_per_trade_pct", 1.5) / 100.0
+        risk_pct = self.capital_manager.regime_confidence_risk_pct("CHOPPY", 0.70, base_pct=base_pct) * self.overnight_risk_multiplier
         lots = self.capital_manager.calculate_lots_by_max_loss(
             self.broker.capital, max_loss_per_unit, lot_size=lot_size, risk_pct_override=risk_pct)
         if lots <= 0:
@@ -529,6 +559,8 @@ class LivePaperTrader:
             {"symbol": pe_long["tsym"], "side": "BUY", "price": pe_long["ltp"]},
         ]
         pos = self.broker.buy_multi(legs, max_loss_per_unit, lots * lot_size, kind="CREDIT_CONDOR")
+        if pos:
+            pos.entry_time = now_ist()
         if not pos:
             logging.warning("Broker rejected condor entry (capital circuit breaker).")
             return False
@@ -570,8 +602,9 @@ class LivePaperTrader:
         max_loss_per_unit = net_debit  # a debit spread's max loss IS the debit paid
 
         lot_size = buy_leg["lot_size"]
+        base_pct = self._regime_config().get("risk_per_trade_pct", 2.0) / 100.0
         risk_pct = self.capital_manager.regime_confidence_risk_pct(
-            self.current_regime, plan.confidence if plan else 0.70) * self.overnight_risk_multiplier
+            self.current_regime, plan.confidence if plan else 0.70, base_pct=base_pct) * self.overnight_risk_multiplier
         lots = self.capital_manager.calculate_lots_by_max_loss(
             self.broker.capital, max_loss_per_unit, lot_size=lot_size, risk_pct_override=risk_pct)
         if lots <= 0:
@@ -583,6 +616,8 @@ class LivePaperTrader:
             {"symbol": sell_leg["tsym"], "side": "SELL", "price": sell_leg["ltp"]},
         ]
         pos = self.broker.buy_multi(legs, max_loss_per_unit, lots * lot_size, kind="DEBIT_SPREAD")
+        if pos:
+            pos.entry_time = now_ist()
         if not pos:
             logging.warning("Broker rejected spread entry (capital circuit breaker).")
             return
@@ -625,10 +660,11 @@ class LivePaperTrader:
         # Expiry-day naked options decay fast and violently — size extra
         # conservatively (half the normal risk cap); TrailManager's tighter
         # expiry_mode (20% partial target vs 40%) handles the exit side.
+        base_pct = self.config.get("risk", {}).get("risk_per_trade_pct", 2.0) / 100.0
         lots = self.capital_manager.calculate_lots_by_delta(
             self.broker.capital, entry_prem, delta=0.35 if kind == "CE" else -0.35,
             lot_size=leg["lot_size"],
-            risk_pct_override=self.capital_manager.max_risk_per_trade_pct * 0.5 * self.overnight_risk_multiplier)
+            risk_pct_override=base_pct * 0.5 * self.overnight_risk_multiplier)
         if lots <= 0:
             logging.warning("Expiry-day trade not affordable within risk cap — skipping.")
             return
@@ -637,6 +673,8 @@ class LivePaperTrader:
         tsym = leg["tsym"]
         disaster = max(1.0, entry_prem * 0.5)
         self.active_position = self.broker.buy(tsym, qty, entry_prem, stop=disaster, target=entry_prem * 2)
+        if self.active_position:
+            self.active_position.entry_time = now_ist()
         if not self.active_position:
             logging.warning("Broker rejected expiry-day entry (capital circuit breaker).")
             return
@@ -725,17 +763,22 @@ class LivePaperTrader:
         self._dashboard_thread.start()
 
     def _start_watchdog(self):
-        """Runs independently of ticks so EOD squareoff fires even if the feed
-        goes quiet (e.g. low liquidity option with no trades for a while)."""
+        """Runs independently of ticks so EOD squareoff AND theta-timeout fire
+        even if the feed goes quiet (e.g. a low-liquidity option with no
+        trades for a while)."""
         def loop():
             while not self._intentional_close:
                 now_t = now_ist().time()
-                if self.active_position and now_t >= self.risk_manager.squareoff:
+
+                # Calling these every cycle (not just at squareoff) is what
+                # lets theta-timeout fire even when ticks have gone quiet —
+                # both functions already contain the full exit-decision logic
+                # and are safe to call repeatedly with the latest known price.
+                if self.active_position:
                     price = self.latest_opt_price or self.active_position.entry
-                    logging.warning("Watchdog: squareoff time reached (naked) — forcing close.")
                     self.evaluate_trail(price)
 
-                if self.active_multi_position and now_t >= self.risk_manager.squareoff:
+                if self.active_multi_position:
                     pos = self.active_multi_position
                     missing = [l["symbol"] for l in pos.legs if l["symbol"] not in self.latest_leg_prices]
                     if missing:
@@ -745,7 +788,6 @@ class LivePaperTrader:
                                 self.latest_leg_prices[sym] = data["last_price"]
                         except Exception as e:
                             logging.warning(f"Watchdog: failed to refresh missing leg quotes ({e}).")
-                    logging.warning("Watchdog: squareoff time reached (multi-leg) — forcing close.")
                     self.evaluate_multi_trail()
 
                 if now_t >= dtime(15, 35):  # safety cutoff well past close either way
@@ -837,6 +879,18 @@ class LivePaperTrader:
         if now_t >= self.risk_manager.squareoff:
             action = "EOD_SQUAREOFF"
 
+        # Theta timeout: config.yaml has had theta_timeout_minutes per regime
+        # for a while, but nothing ever read it. A trade that's gone nowhere
+        # for that long is just bleeding time decay — free the capital for a
+        # better setup instead of parking it till 15:15. Only fires on a
+        # trade that ISN'T currently profitable — a winner is allowed to run.
+        timeout_min = self._regime_config().get("theta_timeout_minutes", 90)
+        elapsed_min = (now_ist() - self.active_position.entry_time).total_seconds() / 60.0
+        if elapsed_min >= timeout_min and current_prem <= self.active_position.entry and action == "HOLD":
+            action = "THETA_TIMEOUT"
+            logging.info(f"Theta timeout: {elapsed_min:.0f} min elapsed (limit {timeout_min}) with no "
+                        f"progress ({current_prem:.2f} vs entry {self.active_position.entry:.2f}).")
+
         if action == "PARTIAL_EXIT" and self.active_position:
             exit_qty = self.active_position.qty // 2
             if exit_qty > 0:
@@ -850,7 +904,7 @@ class LivePaperTrader:
                                       f"PnL={pnl:+.1f}")
             return
 
-        if action in ["FULL_EXIT", "STOP_LOSS", "DISASTER_STOP", "EOD_SQUAREOFF"]:
+        if action in ["FULL_EXIT", "STOP_LOSS", "DISASTER_STOP", "EOD_SQUAREOFF", "THETA_TIMEOUT"]:
             logging.info(f"TRAILING STOP TRIGGERED ({action}). Current price: {current_prem}. Closing position.")
             pnl = self.broker.close(self.active_position, current_prem)
             logging.info(f"Position Closed. Realized PnL: Rs {pnl:.2f}. New Capital: Rs {self.broker.capital:.2f}")
@@ -897,6 +951,13 @@ class LivePaperTrader:
             reason = "STOP_LOSS"
         elif unrealized_pnl >= max_loss_total * 0.5:
             reason = "PROFIT_TARGET"
+        else:
+            timeout_min = self._regime_config().get("theta_timeout_minutes", 90)
+            elapsed_min = (now_ist() - pos.entry_time).total_seconds() / 60.0
+            if elapsed_min >= timeout_min and unrealized_pnl <= 0:
+                reason = "THETA_TIMEOUT"
+                logging.info(f"Theta timeout: {elapsed_min:.0f} min elapsed (limit {timeout_min}) with no "
+                            f"progress (unrealized PnL Rs {unrealized_pnl:.2f}).")
 
         if reason:
             pnl = self.broker.close_multi(pos, exit_prices)
