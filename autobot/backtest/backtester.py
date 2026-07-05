@@ -264,13 +264,32 @@ def build_signals(prev, today, prev2_close, prev3_close=None) -> list:
 
 
 def days_to_nifty_expiry(dt):
+    """
+    Time to next Tuesday expiry, in years (for Black-Scholes t).
+    On expiry day itself this tracks actual intraday decay instead of a
+    constant value all day (old: identical at 9:16 AM and 3:14 PM).
+    """
     from datetime import timedelta
+
     d = dt.date() if hasattr(dt, 'date') else dt
     days = 0
     while d.weekday() != 1:   # 1 = Tuesday
         d += timedelta(days=1)
         days += 1
-    return max(0.1, days) / 365.0
+
+    if days > 0:
+        return max(0.1, days) / 365.0
+
+    session_hours = 6.25  # 9:15 to 15:30
+    is_live_intraday = hasattr(dt, 'hour') and (dt.hour != 0 or dt.minute != 0)
+    if is_live_intraday:
+        market_close = dt.replace(hour=15, minute=30, second=0, microsecond=0)
+        remaining_hours = (market_close - dt).total_seconds() / 3600.0
+        remaining_hours = max(0.5, min(session_hours, remaining_hours))
+    else:
+        remaining_hours = session_hours  # backtest daily bar: assume entry at the 9:15 open
+
+    return (remaining_hours / session_hours) * (1.0 / 365.0)
 
 
 def run_backtest(df, weights=None, capital=100000.0, lots=1, lot_size=75, r=0.068,
