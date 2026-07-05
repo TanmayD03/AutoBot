@@ -4,7 +4,18 @@ import time
 import threading
 import logging
 from datetime import datetime, date, time as dtime, timedelta
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def now_ist() -> datetime:
+    """All trading-hours/squareoff comparisons use this, not naive
+    datetime.now() — if the machine running this isn't set to IST, every
+    time-of-day check in this file would silently be wrong."""
+    return datetime.now(IST)
+
 
 import pandas as pd
 from autobot.data.kite_adapter import KiteAdapter
@@ -270,6 +281,23 @@ class LivePaperTrader:
         return plan
 
     def wait_for_market_open(self):
+        """
+        Waits for actual NSE trading hours (9:15-15:30 IST, Mon-Fri) before
+        treating a quote as live. The old check was just "is LTP > 0", which
+        is trivially true at ANY time of day or night — Kite still returns
+        the last traded price from the previous session even when the market
+        is closed.
+        """
+        now = now_ist()
+        if now.weekday() >= 5:
+            logging.error(f"Today ({now:%A}) is a weekend — NSE is closed. Exiting rather than "
+                          f"proceeding on stale data.")
+            sys.exit(0)
+        if not (dtime(9, 15) <= now.time() <= dtime(15, 30)):
+            logging.error(f"Current IST time is {now:%H:%M:%S}, outside NSE trading hours "
+                          f"(9:15-15:30 IST, Mon-Fri). Exiting rather than proceeding on stale data.")
+            sys.exit(0)
+
         logging.info("Waiting for market open to capture spot price...")
         while True:
             quote = self.kite.quote("NSE:NIFTY 50")
@@ -304,7 +332,7 @@ class LivePaperTrader:
 
                 atm_strike = round(spot / 50) * 50
                 atm_row = min(chain, key=lambda c: abs(c["strike"] - atm_strike))
-                t = days_to_nifty_expiry(datetime.now())
+                t = days_to_nifty_expiry(now_ist())
                 if atm_row["call_ltp"] > 0 and atm_row["put_ltp"] > 0 and t > 0:
                     iv_ce = implied_vol(atm_row["call_ltp"], spot, atm_row["strike"], r=0.068, t=t, kind="C")
                     iv_pe = implied_vol(atm_row["put_ltp"], spot, atm_row["strike"], r=0.068, t=t, kind="P")
@@ -330,6 +358,17 @@ class LivePaperTrader:
                     f"(confidence {refined.confidence:.2f}) — {refined.reason}")
         return refined
 
+    def _get_live_vix(self):
+        """Live India VIX quote — used on intraday re-checks so the condor
+        viability test reflects current volatility, not the premarket value
+        frozen at market open."""
+        try:
+            q = self.kite.quote("NSE:INDIA VIX")
+            return q["NSE:INDIA VIX"]["last_price"]
+        except Exception as e:
+            logging.warning(f"Live VIX quote failed ({e}); using premarket VIX as fallback.")
+            return self.today_row.vix if self.today_row is not None else 15.0
+
     def _resolve_leg(self, strike, kind, expiry_date):
         """Resolve + quote one option leg via Zerodha. Returns a dict or None."""
         try:
@@ -347,31 +386,36 @@ class LivePaperTrader:
         return {"tradingsymbol": meta["tradingsymbol"], "tsym": tsym, "token": meta["instrument_token"],
                 "lot_size": meta["lot_size"], "ltp": ltp}
 
-    def execute_paper_trade(self, plan, spot):
+    def execute_paper_trade(self, spot):
         """
         Strategy router: picks ExpiryDayStrategy / iron condor / defined-risk
         spread / naked CE-PE depending on expiry-day status and the detected
         regime, then delegates to the matching _execute_* method. A failure
         or non-viable setup in one path falls back to the next rather than
-        just giving up for the day — that's the sound way to trade more
-        regularly without weakening the risk gates below.
+        just giving up for the day.
+
+        Fully re-derives its decision from the CURRENT spot and a fresh
+        Kite option-chain snapshot every time it's called — nothing here is
+        cached from market open — which is what makes it safe to call this
+        repeatedly throughout the day (see the retry loop in main()) rather
+        than only once at 9:15.
         """
-        today_date = datetime.now().date()
+        today_date = now_ist().date()
         expiry_date = get_next_tuesday(today_date)
         is_expiry_day = (today_date == expiry_date)
 
-        if not self.risk_manager.can_trade(open_positions=0, now_time=datetime.now().time()):
+        if not self.risk_manager.can_trade(open_positions=0, now_time=now_ist().time()):
             logging.warning("RiskManager blocked entry (halted, max positions, or past squareoff). Skipping trade.")
             return
 
-        if is_expiry_day and self.expiry_strategy.is_valid_window(datetime.now().time()):
+        if is_expiry_day and self.expiry_strategy.is_valid_window(now_ist().time()):
             self._execute_expiry(spot, expiry_date)
             return
 
         refined_plan = self.refine_plan_with_option_chain(spot, expiry_date)
         if refined_plan is None or refined_plan.action == "NO_TRADE":
-            logging.warning(f"Post-open refinement is NO_TRADE ({refined_plan.reason if refined_plan else 'n/a'}). "
-                            f"Skipping trade for today.")
+            logging.warning(f"No qualifying setup right now ({refined_plan.reason if refined_plan else 'n/a'}). "
+                            f"Will check again next cycle rather than giving up for the day.")
             return
 
         if self.current_regime == "CHOPPY":
@@ -401,7 +445,7 @@ class LivePaperTrader:
             logging.error("Invalid premium.")
             return
 
-        t = days_to_nifty_expiry(datetime.now())
+        t = days_to_nifty_expiry(now_ist())
         opt_kind = "C" if kind == "CE" else "P"
         try:
             iv = implied_vol(entry_prem, spot, atm, r=0.068, t=t, kind=opt_kind)
@@ -437,7 +481,7 @@ class LivePaperTrader:
 
         logging.info(f"EXECUTED NAKED TRADE: Bought {qty} ({lots} lots, delta={delta:.2f}, "
                     f"regime={self.current_regime}, risk_pct={risk_pct*100:.1f}%) of {tsym} at {entry_prem}")
-        self.trade_log.append(f"{datetime.now():%H:%M:%S} ENTRY NAKED {tsym} qty={qty} @ Rs{entry_prem:.1f}")
+        self.trade_log.append(f"{now_ist():%H:%M:%S} ENTRY NAKED {tsym} qty={qty} @ Rs{entry_prem:.1f}")
 
     def _execute_condor(self, spot, expiry_date) -> bool:
         """
@@ -445,7 +489,7 @@ class LivePaperTrader:
         VIX. Returns True if placed, False if it backed off — the caller
         then falls back to a defined-risk spread rather than sitting idle.
         """
-        vix_today = self.today_row.vix if self.today_row is not None else 15.0
+        vix_today = self._get_live_vix()
         classification = self.choppy_strategy.evaluate_iron_condor(vix_today)
         if classification == "NO_TRADE":
             logging.info(f"Condor skipped: VIX {vix_today:.1f} too high for a defined-risk condor.")
@@ -499,7 +543,7 @@ class LivePaperTrader:
                     f"max loss/unit {max_loss_per_unit:.2f}. SELL {ce_short['tradingsymbol']}, "
                     f"BUY {ce_long['tradingsymbol']}, SELL {pe_short['tradingsymbol']}, "
                     f"BUY {pe_long['tradingsymbol']}.")
-        self.trade_log.append(f"{datetime.now():%H:%M:%S} ENTRY CONDOR ({classification}) "
+        self.trade_log.append(f"{now_ist():%H:%M:%S} ENTRY CONDOR ({classification}) "
                               f"lots={lots} net_credit={net_credit:.1f}")
         return True
 
@@ -550,7 +594,7 @@ class LivePaperTrader:
         direction = "BULL CALL" if bullish else "BEAR PUT"
         logging.info(f"EXECUTED {direction} SPREAD: {lots} lots, net debit {net_debit:.2f} (max loss/unit). "
                     f"BUY {buy_leg['tradingsymbol']}, SELL {sell_leg['tradingsymbol']}.")
-        self.trade_log.append(f"{datetime.now():%H:%M:%S} ENTRY {direction} SPREAD lots={lots} "
+        self.trade_log.append(f"{now_ist():%H:%M:%S} ENTRY {direction} SPREAD lots={lots} "
                               f"net_debit={net_debit:.1f}")
 
     def _execute_expiry(self, spot, expiry_date):
@@ -562,7 +606,7 @@ class LivePaperTrader:
             logging.warning(f"Expiry chain fetch failed ({e}); using spot as max-pain fallback.")
             pain = spot
 
-        action, strike = self.expiry_strategy.evaluate(datetime.now().time(), spot, pain)
+        action, strike = self.expiry_strategy.evaluate(now_ist().time(), spot, pain)
         if action == "NO_TRADE":
             logging.info(f"Expiry-day max-pain check: no edge (spot {spot:.0f} vs max pain {pain:.0f}).")
             return
@@ -607,7 +651,7 @@ class LivePaperTrader:
 
         logging.info(f"EXECUTED EXPIRY-DAY MAX-PAIN TRADE: {lots} lots of {tsym} at {entry_prem} "
                     f"(spot {spot:.0f}, max pain {pain:.0f}).")
-        self.trade_log.append(f"{datetime.now():%H:%M:%S} ENTRY EXPIRY {tsym} qty={qty} @ Rs{entry_prem:.1f}")
+        self.trade_log.append(f"{now_ist():%H:%M:%S} ENTRY EXPIRY {tsym} qty={qty} @ Rs{entry_prem:.1f}")
 
     def _dashboard_update(self, state):
         """Pulls current system state into the Dashboard's expected shape.
@@ -685,7 +729,7 @@ class LivePaperTrader:
         goes quiet (e.g. low liquidity option with no trades for a while)."""
         def loop():
             while not self._intentional_close:
-                now_t = datetime.now().time()
+                now_t = now_ist().time()
                 if self.active_position and now_t >= self.risk_manager.squareoff:
                     price = self.latest_opt_price or self.active_position.entry
                     logging.warning("Watchdog: squareoff time reached (naked) — forcing close.")
@@ -789,7 +833,7 @@ class LivePaperTrader:
         if current_prem <= self.active_position.stop:
             action = "DISASTER_STOP"
 
-        now_t = datetime.now().time()
+        now_t = now_ist().time()
         if now_t >= self.risk_manager.squareoff:
             action = "EOD_SQUAREOFF"
 
@@ -802,7 +846,7 @@ class LivePaperTrader:
                 logging.info(f"PARTIAL PROFIT BOOKED: {exit_qty} qty @ {current_prem}. "
                             f"Realized: Rs {pnl:.2f}. Remaining qty {self.active_position.qty} "
                             f"now stopped at breakeven ({self.active_position.stop:.2f}).")
-                self.trade_log.append(f"{datetime.now():%H:%M:%S} PARTIAL EXIT {exit_qty}qty @ Rs{current_prem:.1f} "
+                self.trade_log.append(f"{now_ist():%H:%M:%S} PARTIAL EXIT {exit_qty}qty @ Rs{current_prem:.1f} "
                                       f"PnL={pnl:+.1f}")
             return
 
@@ -810,7 +854,7 @@ class LivePaperTrader:
             logging.info(f"TRAILING STOP TRIGGERED ({action}). Current price: {current_prem}. Closing position.")
             pnl = self.broker.close(self.active_position, current_prem)
             logging.info(f"Position Closed. Realized PnL: Rs {pnl:.2f}. New Capital: Rs {self.broker.capital:.2f}")
-            self.trade_log.append(f"{datetime.now():%H:%M:%S} EXIT ({action}) PnL={pnl:+.1f} "
+            self.trade_log.append(f"{now_ist():%H:%M:%S} EXIT ({action}) PnL={pnl:+.1f} "
                                   f"Capital=Rs{self.broker.capital:.0f}")
             self.active_position = None
 
@@ -845,7 +889,7 @@ class LivePaperTrader:
         unrealized_pnl = pos.entry_net_cash + mtm_flow
         max_loss_total = pos.max_loss_per_unit * pos.qty
 
-        now_t = datetime.now().time()
+        now_t = now_ist().time()
         reason = None
         if now_t >= self.risk_manager.squareoff:
             reason = "EOD_SQUAREOFF"
@@ -858,7 +902,7 @@ class LivePaperTrader:
             pnl = self.broker.close_multi(pos, exit_prices)
             logging.info(f"MULTI-LEG EXIT ({reason}, {pos.kind}): Realized PnL Rs {pnl:.2f}. "
                         f"New capital Rs {self.broker.capital:.2f}")
-            self.trade_log.append(f"{datetime.now():%H:%M:%S} EXIT {pos.kind} ({reason}) PnL={pnl:+.1f} "
+            self.trade_log.append(f"{now_ist():%H:%M:%S} EXIT {pos.kind} ({reason}) PnL={pnl:+.1f} "
                                   f"Capital=Rs{self.broker.capital:.0f}")
             self.active_multi_position = None
             self.leg_tokens = {}
@@ -881,41 +925,86 @@ def main():
     plan = trader.run_premarket_analysis()
 
     if plan is None:
-        # A NO_TRADE premarket bias no longer means "do nothing all day" —
-        # CHOPPY/HIGH_VOLATILITY/expiry-day strategies are evaluated post-open
-        # regardless, so we still try to trade rather than exiting outright.
-        logging.info("Premarket bias is NO_TRADE, but regime/expiry-day strategies "
-                     "will still be evaluated after market open.")
+        logging.info("Premarket bias is NO_TRADE, but the system will keep checking for a "
+                     "qualifying setup throughout the day rather than stopping here.")
 
     trader._start_dashboard(refresh=20.0)  # periodic full-state snapshot for the rest of the session
 
     spot = trader.wait_for_market_open()
-    trader.execute_paper_trade(plan, spot)
 
-    if trader.active_position or trader.active_multi_position:
+    # Retry loop: the system does NOT get just one look at the market at
+    # 9:15 and then give up for the day. It re-checks for a qualifying setup
+    # — across regimes, using a fresh Kite option-chain snapshot and the
+    # current spot every time — until either a trade opens, the entry
+    # cutoff passes, or RiskManager halts. This does not lower the
+    # confidence threshold or force a trade on a genuinely quiet day; it
+    # just gives the system many chances instead of one, which is the
+    # honest way to reduce "zero trades all week" without weakening any
+    # risk gate.
+    NEW_ENTRY_CUTOFF = dtime(14, 45)   # leaves 30 min of runway before the 15:15 squareoff
+    RETRY_POLL_SECONDS = 900           # re-check every 15 minutes when nothing qualifies
+
+    while True:
+        now = now_ist()
+        if now.time() >= NEW_ENTRY_CUTOFF:
+            logging.info(f"Past the new-entry cutoff ({NEW_ENTRY_CUTOFF}) with no open position — "
+                        f"not enough runway left before squareoff for a fresh trade. Ending session.")
+            break
+        if trader.risk_manager.halted:
+            logging.info("RiskManager has halted trading for the day (kill switch or profit lock hit). "
+                        "No further entries will be attempted.")
+            break
+
         try:
-            trader.start_websocket()
-        except KeyboardInterrupt:
-            logging.warning("Ctrl+C received — closing any open position at last known price before exit.")
-            trader._intentional_close = True
-            if trader.active_position and trader.latest_opt_price:
-                pnl = trader.broker.close(trader.active_position, trader.latest_opt_price)
-                trader.risk_manager.register_pnl(pnl)
-                logging.info(f"Manual close PnL: Rs {pnl:.2f}")
-            if trader.active_multi_position:
-                pos = trader.active_multi_position
-                try:
-                    q = trader.kite.quote([l["symbol"] for l in pos.legs])
-                    exit_prices = {sym: data["last_price"] for sym, data in q.items()}
-                except Exception:
-                    exit_prices = {l["symbol"]: l["entry"] for l in pos.legs}  # last resort
-                pnl = trader.broker.close_multi(pos, exit_prices)
-                trader.risk_manager.register_pnl(pnl)
-                logging.info(f"Manual multi-leg close PnL: Rs {pnl:.2f}")
-            if trader.ticker:
-                trader.ticker.close()
-    else:
-        print("No trade was placed today (all strategies passed, or were unaffordable/unresolvable). Exiting.")
+            quote = trader.kite.quote("NSE:NIFTY 50")
+            spot = quote["NSE:NIFTY 50"]["last_price"]
+            trader.latest_spot = spot
+        except Exception as e:
+            logging.warning(f"Spot quote refresh failed ({e}); retrying next cycle.")
+            time.sleep(RETRY_POLL_SECONDS)
+            continue
+
+        trader.execute_paper_trade(spot)
+
+        if trader.active_position or trader.active_multi_position:
+            # Fresh per-position session state so the websocket/watchdog for
+            # THIS trade start cleanly (a prior trade today may have already
+            # used and torn down its own instance of both).
+            trader._intentional_close = False
+            trader._reconnect_attempts = 0
+            trader._watchdog_thread = None
+            try:
+                trader.start_websocket()  # blocks until THIS position closes
+            except KeyboardInterrupt:
+                logging.warning("Ctrl+C received — closing any open position at last known price before exit.")
+                trader._intentional_close = True
+                if trader.active_position and trader.latest_opt_price:
+                    pnl = trader.broker.close(trader.active_position, trader.latest_opt_price)
+                    trader.risk_manager.register_pnl(pnl)
+                    logging.info(f"Manual close PnL: Rs {pnl:.2f}")
+                if trader.active_multi_position:
+                    pos = trader.active_multi_position
+                    try:
+                        q = trader.kite.quote([l["symbol"] for l in pos.legs])
+                        exit_prices = {sym: data["last_price"] for sym, data in q.items()}
+                    except Exception:
+                        exit_prices = {l["symbol"]: l["entry"] for l in pos.legs}  # last resort
+                    pnl = trader.broker.close_multi(pos, exit_prices)
+                    trader.risk_manager.register_pnl(pnl)
+                    logging.info(f"Manual multi-leg close PnL: Rs {pnl:.2f}")
+                if trader.ticker:
+                    trader.ticker.close()
+                break  # Ctrl+C ends the whole session, not just this one trade
+
+            logging.info("Position closed. Checking whether another opportunity exists "
+                        "for the rest of the day...")
+            continue  # loop back and look for another trade
+        else:
+            logging.info(f"No qualifying setup this check. Re-checking in "
+                        f"{RETRY_POLL_SECONDS // 60} minutes...")
+            time.sleep(RETRY_POLL_SECONDS)
+
+    print("Session loop ended (cutoff reached, halted, or manually stopped).")
 
 
 if __name__ == "__main__":
