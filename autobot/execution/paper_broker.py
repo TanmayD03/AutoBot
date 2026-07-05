@@ -1,8 +1,9 @@
 """PaperBroker — default execution venue. Realistic fills with slippage and
 Indian F&O cost model (brokerage, STT, exchange charges, GST, stamp duty approximation).
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
+from datetime import datetime
 
 
 @dataclass
@@ -13,6 +14,7 @@ class Position:
     stop: float
     target: float
     direction: int = 1  # long premium
+    entry_time: datetime = field(default_factory=datetime.now)  # for theta-timeout checks
 
 
 @dataclass
@@ -24,6 +26,7 @@ class MultiLegPosition:
     qty: int
     kind: str            # e.g. "DEBIT_SPREAD", "CREDIT_CONDOR"
     entry_net_cash: float  # cash flow at entry (positive=credit received, negative=debit paid)
+    entry_time: datetime = field(default_factory=datetime.now)  # for theta-timeout checks
 
 
 @dataclass
