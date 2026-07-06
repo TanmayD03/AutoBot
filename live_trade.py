@@ -960,12 +960,35 @@ class LivePaperTrader:
         elif unrealized_pnl >= max_loss_total * 0.5:
             reason = "PROFIT_TARGET"
         else:
-            timeout_min = self._regime_config().get("theta_timeout_minutes", 90)
-            elapsed_min = (now_ist() - pos.entry_time).total_seconds() / 60.0
-            if elapsed_min >= timeout_min and unrealized_pnl <= 0:
-                reason = "THETA_TIMEOUT"
-                logging.info(f"Theta timeout: {elapsed_min:.0f} min elapsed (limit {timeout_min}) with no "
-                            f"progress (unrealized PnL Rs {unrealized_pnl:.2f}).")
+            # Credit strategies (iron condors) and debit strategies (vertical
+            # spreads) need OPPOSITE theta-timeout treatment. A debit spread
+            # behaves like a directional bet — if it's flat after a while,
+            # cut it, same spirit as a naked option. A credit condor's ENTIRE
+            # edge IS time decay — a short timeout that fires while the
+            # position is merely flat closes it before that edge has any
+            # chance to work. This was confirmed directly: a real-data replay
+            # (config's old 60-min choppy timeout) closed 6/6 condors at a
+            # loss, every single one via theta-timeout, before meaningful
+            # decay had occurred.
+            if pos.kind == "CREDIT_CONDOR":
+                timeout_min = self._regime_config().get("credit_theta_timeout_minutes", 180)
+                tolerance_pct = self._regime_config().get("credit_theta_loss_tolerance_pct", 15) / 100.0
+                elapsed_min = (now_ist() - pos.entry_time).total_seconds() / 60.0
+                # Only bail if it's genuinely deteriorating (real loss beyond
+                # tolerance), not just sitting flat — flat is exactly what a
+                # condor is SUPPOSED to look like while theta does its work.
+                if elapsed_min >= timeout_min and unrealized_pnl <= -max_loss_total * tolerance_pct:
+                    reason = "THETA_TIMEOUT"
+                    logging.info(f"Theta timeout (credit): {elapsed_min:.0f} min elapsed (limit {timeout_min}), "
+                                f"genuinely deteriorating (unrealized Rs {unrealized_pnl:.2f}, "
+                                f"beyond {tolerance_pct*100:.0f}% of max loss tolerance).")
+            else:  # DEBIT_SPREAD — directional-style timeout, same spirit as naked options
+                timeout_min = self._regime_config().get("theta_timeout_minutes", 90)
+                elapsed_min = (now_ist() - pos.entry_time).total_seconds() / 60.0
+                if elapsed_min >= timeout_min and unrealized_pnl <= 0:
+                    reason = "THETA_TIMEOUT"
+                    logging.info(f"Theta timeout (debit): {elapsed_min:.0f} min elapsed (limit {timeout_min}) "
+                                f"with no progress (unrealized Rs {unrealized_pnl:.2f}).")
 
         if reason:
             pnl = self.broker.close_multi(pos, exit_prices)
