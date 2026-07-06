@@ -18,7 +18,9 @@ regimes:
     min_delta: 0.45
     reward_risk_min: 1.5
     risk_per_trade_pct: 1.5
-    theta_timeout_minutes: 60
+    theta_timeout_minutes: 60          # applies to the CHOPPY-regime debit-spread fallback (directional-style exit)
+    credit_theta_timeout_minutes: 180  # iron condors: theta IS the edge — needs hours, not 60 min, to materialize
+    credit_theta_loss_tolerance_pct: 15  # only timeout a condor if it's genuinely deteriorating (>=15% of max loss), not just flat
   high_volatility:
     confidence_threshold: 0.65
     daily_max_loss_pct: 4.0
