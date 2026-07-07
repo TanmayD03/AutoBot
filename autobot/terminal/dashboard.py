@@ -44,11 +44,13 @@ class Dashboard:
         pos_lines = [f"{p.symbol} qty {p.qty} entry {p.entry:.2f} stop {p.stop:.2f} target {p.target:.2f}"
                      for p in self.state["positions"]] or ["(flat)"]
         trade_lines = [str(t) for t in self.state["trades"][-5:]] or ["(no trades yet)"]
+        latency = self.state.get("latency_ms")
+        latency_str = f"{latency:.0f} ms" if latency is not None else "N/A (flat, no active tick stream)"
         footer = Panel(Group(
             f"[bold]{self.state['status']}[/bold]  Day P&L: "
             f"[{'green' if pnl >= 0 else 'red'}]{pnl:+.2f}[/]  "
             f"(kill {self.state['kill_limit']:+.0f} / lock {self.state['profit_lock']:+.0f})  "
-            f"latency {self.state['latency_ms']:.0f} ms",
+            f"latency {latency_str}",
             "Positions: " + " | ".join(pos_lines),
             "Recent trades: " + " | ".join(trade_lines)), title="Risk & Execution")
         layout["bottom"].update(footer)
