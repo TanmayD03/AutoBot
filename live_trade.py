@@ -420,6 +420,33 @@ class LivePaperTrader:
         return {"tradingsymbol": meta["tradingsymbol"], "tsym": tsym, "token": meta["instrument_token"],
                 "lot_size": meta["lot_size"], "ltp": ltp}
 
+    def _log_decision(self, spot, regime, signals, plan, executed_as=None):
+        """
+        Appends every decision check to a CSV — regime, every signal's
+        score/confidence, the final combined confidence/action, and what (if
+        anything) got executed. Needed to actually audit signal thresholds
+        against real outcomes later (the same kind of check that caught
+        atr_pct_choppy being wrong), and gives a real record beyond whatever
+        happens to be visible in the terminal at the time.
+        """
+        import csv as _csv
+        path = "decision_log.csv"
+        is_new = not os.path.exists(path)
+        try:
+            with open(path, "a", newline="") as f:
+                w = _csv.writer(f)
+                if is_new:
+                    w.writerow(["timestamp", "spot", "regime", "signal_name", "signal_score",
+                               "signal_confidence", "combined_confidence", "combined_score",
+                               "action", "executed_as"])
+                ts = now_ist().isoformat()
+                for s in signals:
+                    w.writerow([ts, spot, regime, s.name, f"{s.score:.4f}", f"{s.confidence:.4f}",
+                               f"{plan.confidence:.4f}" if plan else "", f"{plan.score:.4f}" if plan else "",
+                               plan.action if plan else "NO_TRADE", executed_as or ""])
+        except Exception as e:
+            logging.warning(f"Decision log write failed ({e}) — continuing without it.")
+
     def execute_paper_trade(self, spot):
         """
         Strategy router: picks ExpiryDayStrategy / iron condor / defined-risk
@@ -438,7 +465,8 @@ class LivePaperTrader:
         expiry_date = get_next_tuesday(today_date)
         is_expiry_day = (today_date == expiry_date)
 
-        if not self.risk_manager.can_trade(open_positions=0, now_time=now_ist().time()):
+        real_open_count = int(bool(self.active_position)) + int(bool(self.active_multi_position))
+        if not self.risk_manager.can_trade(open_positions=real_open_count, now_time=now_ist().time()):
             logging.warning("RiskManager blocked entry (halted, max positions, or past squareoff). Skipping trade.")
             return
 
@@ -450,6 +478,7 @@ class LivePaperTrader:
         if refined_plan is None or refined_plan.action == "NO_TRADE":
             logging.warning(f"No qualifying setup right now ({refined_plan.reason if refined_plan else 'n/a'}). "
                             f"Will check again next cycle rather than giving up for the day.")
+            self._log_decision(spot, self.current_regime, self.premarket_signals, refined_plan)
             return
 
         if self.current_regime == "CHOPPY":
@@ -458,10 +487,19 @@ class LivePaperTrader:
                 logging.info("Condor not viable (VIX too high, unresolved legs, or unaffordable) — "
                             "falling back to a defined-risk spread instead of sitting out.")
                 self._execute_spread(spot, refined_plan, expiry_date)
+                self._log_decision(spot, self.current_regime, self.premarket_signals, refined_plan,
+                                   executed_as="SPREAD(fallback)")
+            else:
+                self._log_decision(spot, self.current_regime, self.premarket_signals, refined_plan,
+                                   executed_as="CONDOR")
         elif self.current_regime == "HIGH_VOLATILITY":
             self._execute_spread(spot, refined_plan, expiry_date)
+            self._log_decision(spot, self.current_regime, self.premarket_signals, refined_plan,
+                               executed_as="SPREAD")
         else:  # TRENDING
             self._execute_naked(spot, refined_plan, expiry_date, today_date)
+            self._log_decision(spot, self.current_regime, self.premarket_signals, refined_plan,
+                               executed_as="NAKED")
 
     def _execute_naked(self, spot, plan, expiry_date, today_date):
         """TRENDING regime: single-leg naked CE/PE, sized by delta."""
@@ -710,7 +748,13 @@ class LivePaperTrader:
         state["kill_limit"] = -self.risk_manager.current_dynamic_max_loss
         state["profit_lock"] = self.risk_manager.daily_profit_target
         state["signals"] = self.premarket_signals
-        state["latency_ms"] = (time.time() - self.last_tick_time) * 1000 if self.latest_spot else 0.0
+        # latency_ms only means anything while a WebSocket tick stream is
+        # actually running — that only happens once a position is open. While
+        # flat, last_tick_time is frozen at object construction, so this used
+        # to display "time since script started" mislabeled as feed latency,
+        # growing unboundedly and looking exactly like a stuck connection.
+        has_active_stream = bool(self.active_position or self.active_multi_position)
+        state["latency_ms"] = ((time.time() - self.last_tick_time) * 1000) if has_active_stream else None
 
         # Sentiment panel: real headlines, tagged with the aggregate score —
         # SentimentEnsemble only returns one combined score, not per-headline,
@@ -753,19 +797,54 @@ class LivePaperTrader:
         state["positions"] = positions
         state["trades"] = self.trade_log
 
+    def _refresh_display_quote(self):
+        """Cheap, display-only refresh of spot (and occasionally VIX) — NOT
+        tied to the 15-minute decision-making cadence in main()'s retry loop.
+        That 15-min interval is intentional (real decisions shouldn't fire
+        more often than that), but showing the same stale price for the
+        whole 15 minutes made the dashboard look frozen even though the
+        system was working correctly. This just keeps the display live."""
+        try:
+            q = self.kite.quote("NSE:NIFTY 50")
+            self.latest_spot = q["NSE:NIFTY 50"]["last_price"]
+        except Exception as e:
+            logging.debug(f"Display quote refresh failed ({e})")
+
+    def _refresh_sentiment(self):
+        """Sentiment was only ever fetched once, pre-market, then frozen for
+        the entire session — real news breaks intraday. Re-fetches
+        periodically instead."""
+        try:
+            headlines = self.sentiment.fetch_headlines()
+            sent_score, sent_conf = self.sentiment.score(headlines)
+            self.last_headlines = headlines
+            self.sent_score = sent_score
+            logging.info(f"Sentiment refreshed: score={sent_score:+.2f} conf={sent_conf:.2f} "
+                        f"from {len(headlines)} headlines")
+        except Exception as e:
+            logging.warning(f"Sentiment refresh failed ({e}); keeping previous value.")
+
     def _start_dashboard(self, refresh=20.0):
         """Prints a full-state snapshot every `refresh` seconds from a
         background thread. Deliberately NOT a persistent Live-updating pane —
         that would fight with normal logging.info() calls from other threads
         for terminal ownership. A periodic snapshot coexists cleanly with
         the regular event log instead."""
+        SENTIMENT_REFRESH_EVERY_N_CYCLES = max(1, int(1800 / refresh))  # ~30 min
+
         def loop():
+            cycle = 0
             while not self._intentional_close:
                 try:
+                    if not (self.active_position or self.active_multi_position):
+                        self._refresh_display_quote()
+                    if cycle % SENTIMENT_REFRESH_EVERY_N_CYCLES == 0 and cycle > 0:
+                        self._refresh_sentiment()
                     self._dashboard_update(self.dashboard.state)
                     self.dashboard.snapshot()
                 except Exception as e:
                     logging.warning(f"Dashboard render failed ({e})")
+                cycle += 1
                 time.sleep(refresh)
         self._dashboard_thread = threading.Thread(target=loop, daemon=True)
         self._dashboard_thread.start()
