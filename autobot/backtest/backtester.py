@@ -15,6 +15,7 @@ strike-level option chain OI/PCR/GEX, FII/DII flows, intraday ticks, GIFT Nifty.
 import csv
 import math
 import os
+import logging
 from datetime import datetime, time as dtime, timedelta
 import numpy as np
 from ..options_math import bs_price
@@ -120,7 +121,37 @@ def load_history(years=20):
             else:
                 chg = data[tkr]["Close"].pct_change(fill_method=None) * 100
                 df[f"{name}_chg"] = chg.reindex(df.index, method="ffill").shift(1).fillna(0.0)
-        except Exception:
+            # A silent 0.0 fallback is indistinguishable from a genuinely flat
+            # day — if the batch call actually returned no usable data for
+            # this ticker (all-NaN after reindex), that's a real data gap,
+            # not "unchanged". Retry once via an individual download before
+            # accepting 0.0, and log clearly either way so a bad fetch is
+            # visible instead of silently masquerading as valid data.
+            if df[f"{name}_chg"].tail(5).eq(0.0).all():
+                logging.warning(f"load_history: '{name}' ({tkr}) came back all-zero from the batch "
+                                f"download — retrying individually before accepting as real.")
+                try:
+                    single = yf.download(tkr, period=f"{years}y", interval="1d",
+                                         progress=False, auto_adjust=True)
+                    single.columns = [c[0] if isinstance(c, tuple) else c for c in single.columns]
+                    if name in ("nikkei", "kospi"):
+                        chg2 = (single["Open"] / single["Close"].shift(1) - 1).dropna() * 100
+                        df[f"{name}_chg"] = chg2.reindex(df.index, method="ffill").fillna(0.0)
+                    else:
+                        chg2 = single["Close"].pct_change(fill_method=None) * 100
+                        df[f"{name}_chg"] = chg2.reindex(df.index, method="ffill").shift(1).fillna(0.0)
+                    if not df[f"{name}_chg"].tail(5).eq(0.0).all():
+                        logging.info(f"load_history: individual retry for '{name}' recovered real data.")
+                    else:
+                        logging.warning(f"load_history: '{name}' ({tkr}) still all-zero after individual "
+                                        f"retry — may genuinely be stale/unavailable, treat this signal "
+                                        f"with caution today.")
+                except Exception as e2:
+                    logging.warning(f"load_history: individual retry for '{name}' also failed ({e2}); "
+                                    f"keeping 0.0 fallback — treat this signal with caution today.")
+        except Exception as e:
+            logging.warning(f"load_history: '{name}' ({tkr}) fetch failed entirely ({e}); defaulting "
+                            f"to 0.0 — treat this signal with caution today.")
             df[f"{name}_chg"] = 0.0
 
     # After all downloads, fill any remaining NaN columns (handles 403 errors on yfinance)
