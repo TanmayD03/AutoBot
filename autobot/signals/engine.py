@@ -82,7 +82,14 @@ def pcr_signal(pcr: float) -> SignalScore:
 
 
 def vix_signal(vix: float, vix_chg_pct: float) -> SignalScore:
-    vix_level_factor = min(1.0, vix / 18.0)
+    # Was /18.0 — checked against 63 real trading days: that saturated
+    # (hit its 1.0 ceiling) on 41% of ALL days, meaning a mildly-elevated
+    # VIX (18.5) and a genuinely extreme one (25.5) got identical treatment
+    # over 4 days in 10. Recalibrated to 20.0, which drops saturation to
+    # 9.5% of days AND matches RegimeDetector's own vix_high=20.0 — same
+    # "elevated VIX" boundary used consistently in two places instead of
+    # two different uncoordinated numbers.
+    vix_level_factor = min(1.0, vix / 20.0)
     score = _clip(-vix_chg_pct / 8.0 * vix_level_factor)
     # LOW-VIX NOISE: when VIX is below 16, a rise is usually reversion not fear
     if vix < 16.0 and vix_chg_pct > 0:
